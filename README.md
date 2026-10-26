@@ -6,7 +6,8 @@ I have Somfy Sonesse2 40 Zigbee motors on venetian blinds. They came with a TaHo
 
 What is here:
 
-- `somfy_setup.py`, a guided tool that finds a motor over Bluetooth, makes it leave the TaHoma network so Zigbee2MQTT can pair it, checks whether it is calibrated, and lets you set or fine-tune the limits. Works on macOS, Windows and Linux.
+- A Home Assistant integration (installable through HACS) that adds a **Somfy setup** page to the sidebar. Open it on the phone or laptop that is next to the blind: the browser does the Bluetooth part, Home Assistant does the Zigbee2MQTT part. Nothing to install on the phone.
+- `somfy_setup.py`, the same thing as a command line tool for macOS, Windows and Linux, for people whose Home Assistant is not on https (see below) or who don't use Home Assistant at all.
 - `zigbee2mqtt/somfy_sonesse2_40_venetian.mjs`, an external converter for Zigbee2MQTT. Without it the venetian motor shows up as "Not supported" and its buttons do nothing, because Zigbee2MQTT talks to the wrong endpoint.
 
 Nothing here needs the programming button on the motor head. Mine is hidden inside the headrail and I was not going to take the blinds down for it.
@@ -22,7 +23,29 @@ The sticker also has an Install Code and an EUI48. You do not need them.
 
 Do not press **Reset device** in TaHoma Pro. It is a factory reset and the motor forgets its limits. You do not have to delete the motor from the TaHoma app either, the tool takes it off that network itself. (I did delete mine first, and it arrived in Zigbee2MQTT without limits. I do not know yet which of the two caused that, so the tool checks and calibrates if needed.)
 
-## Install
+## The Home Assistant integration
+
+### What it needs
+
+- Zigbee2MQTT and the MQTT integration, which you have if Zigbee2MQTT devices show up in Home Assistant.
+- **Home Assistant reachable over `https://`.** Browsers only allow Bluetooth and the camera on https pages. The Home Assistant Cloud address, a Let's Encrypt certificate (DuckDNS add-on, NGINX proxy add-on) or the Tailscale add-on's HTTPS proxy all work. A self-signed certificate does not. For a quick try on plain http, Chrome has a developer switch: open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add your Home Assistant address, enable it and relaunch.
+- **Chrome or Edge** on Android, Windows, macOS or Linux, opened on the Home Assistant web address, not inside the Home Assistant companion app (its built-in browser has no Web Bluetooth). iPhones: Safari and every other iOS browser lack Web Bluetooth; the Bluefy app is the exception, or use the command line tool.
+
+### Install
+
+Through HACS: HACS > ⋮ > Custom repositories, add `https://github.com/guilhermedanielgomes/somfy-zigbee-setup` as an Integration, then download **Somfy Zigbee Setup** and restart Home Assistant.
+
+By hand: copy `custom_components/somfy_zigbee_setup` into `/config/custom_components/` and restart Home Assistant.
+
+Then Settings > Devices & services > Add integration > **Somfy Zigbee Setup**. The only setting is the Zigbee2MQTT base topic (`zigbee2mqtt` unless you changed it). A **Somfy setup** entry appears in the sidebar, for administrators.
+
+### Using it
+
+The page lists the Somfy motors Zigbee2MQTT knows, with a **Check calibration** button (reads `configStatus`, see below) and a **Calibrate** button. **Add a blind** is the wizard: type the EUI64 and Pin Code or scan the sticker's QR code, connect over Bluetooth (the browser shows the Somfy motors it can hear, pick any, the page checks it is the right one and jogs it), then it turns on permit join, makes the motor leave its network, waits for Zigbee2MQTT to report the join, reads `configStatus` and, if needed, takes you to the calibration buttons.
+
+The Bluetooth commands are the same ones the command line tool sends, byte for byte. Home Assistant itself never uses Bluetooth; it only publishes and listens on MQTT.
+
+## The command line tool
 
 Either download the executable for your system from the [releases](../../releases) page, or run the Python script:
 
@@ -34,7 +57,7 @@ On Windows use `venv\Scripts\python` instead of `venv/bin/python`. Python 3.8 or
 
 On macOS the first run asks whether Terminal may use Bluetooth. Click Allow. With Python 3.8 or 3.9 the first run can then stop with "Bluetooth device is turned off" while that popup is still on screen; just run it again.
 
-## Pairing a blind with Zigbee2MQTT
+### Pairing a blind with the tool
 
 Close the TaHoma Pro app on your phone first. The motor takes one Bluetooth connection at a time.
 
@@ -57,7 +80,7 @@ You can also run the steps on their own:
 
 ## Calibration
 
-The limits live in the motor. You can change them while the blind stays paired with Zigbee2MQTT, and Zigbee2MQTT keeps controlling it meanwhile. These are the commands at the `somfy>` prompt:
+Same buttons on the Home Assistant page, same commands at the tool's `somfy>` prompt. The limits live in the motor. You can change them while the blind stays paired with Zigbee2MQTT, and Zigbee2MQTT keeps controlling it meanwhile. The tool's commands:
 
     identify                     jog the motor once
     status                       ask Zigbee2MQTT whether the motor is calibrated
@@ -92,8 +115,9 @@ On my blinds the slats turn during the first part of every movement, and the mot
 ## Tested with
 
 - Somfy Sonesse2 40 Zigbee on a venetian blind, firmware `5170183A07.6C14BC12` (TaHoma Pro showed it as A009)
-- macOS 15 on a MacBook, Python 3.8 with bleak 0.22.3; also Python 3.13 with bleak 3.0
-- Zigbee2MQTT 2.7 (Home Assistant add-on), Sonoff Zigbee USB dongle
+- Zigbee2MQTT 2.7 (Home Assistant add-on), Sonoff Zigbee USB dongle, Mosquitto add-on
+- The tool: macOS 15 on a MacBook, Python 3.8 with bleak 0.22.3; also Python 3.13 with bleak 3.0
+- The integration: Chrome on macOS and Android
 
 Other Sonesse2 Zigbee motors use the same Bluetooth commands, so they should work, but I have only tried mine. If you try another model, open an issue and say what happened.
 
@@ -102,6 +126,10 @@ Other Sonesse2 Zigbee motors use the same Bluetooth commands, so they should wor
 The Bluetooth protocol is Somfy's own, found by [Melair](https://mrmelair.com/2024/07/10/hacking-the-somfy-sonesse2-zigbee-motors/) by taking the TaHoma Pro Android app apart. The PIN from the sticker is written to one characteristic, then each command is a write to another one: leave network, move up or down by n steps, save the limit at the current position, start or finish the range setup. This tool only sends those. It has no factory reset and does not touch the motor's firmware or configuration files.
 
 Over Zigbee the motor is a standard window covering (cluster 258) on endpoint 1. `configStatus` is attribute 7 of that cluster and its lowest bit means "operational".
+
+## Development
+
+The Home Assistant side has tests (`pip install -r requirements_test.txt`, then `python -m pytest`). The panel is plain JavaScript in `custom_components/somfy_zigbee_setup/frontend/panel.js`, no build step. QR codes are decoded in the browser with [jsQR](https://github.com/cozmo/jsQR) (Apache 2.0, included).
 
 ## Credits
 

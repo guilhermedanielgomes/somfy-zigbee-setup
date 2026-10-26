@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Somfy Zigbee Setup",
+        "description": "Adds a 'Somfy setup' page to the sidebar for pairing and calibrating Somfy Zigbee motors through Zigbee2MQTT. The Bluetooth part runs in the browser of the phone or laptop you use next to the blind, so Home Assistant needs no Bluetooth itself.",
+        "data": {
+          "base_topic": "Zigbee2MQTT base topic"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only one instance is possible."
+    }
+  }
+}

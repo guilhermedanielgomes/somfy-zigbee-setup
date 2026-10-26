@@ -1,0 +1,14 @@
+{
+  "domain": "somfy_zigbee_setup",
+  "name": "Somfy Zigbee Setup",
+  "codeowners": ["@guilhermedanielgomes"],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "websocket_api", "mqtt"],
+  "documentation": "https://github.com/guilhermedanielgomes/somfy-zigbee-setup",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/guilhermedanielgomes/somfy-zigbee-setup/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
