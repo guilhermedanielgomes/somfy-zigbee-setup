@@ -360,9 +360,10 @@ const STYLE = `
 `;
 
 const JOIN_TIMEOUT = 180000;
-// Hold-to-move: the biggest move the motor accepts, repeated while the button is held
-const HOLD_STEPS = 500;
-const HOLD_REPEAT = 1000;
+// Hold-to-move: the motor finishes one move before it takes the next, so while the
+// button is held the move is offered again every 150 ms and the motor picks it up
+// as soon as it is free. On a Sonesse2 40, 500 steps is about a second of travel.
+const HOLD_REPEAT = 150;
 
 class SomfyZigbeeSetupPanel extends HTMLElement {
   constructor() {
@@ -803,11 +804,11 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
 
   calibrationControls() {
     return `
-      <p class="muted">Hold ▲ or ▼ to move the blind; it stops when you let go. Put the blind where a limit should be, then save it. From scratch (configStatus even): Range start, hold ▼ to the bottom and save the bottom limit, hold ▲ to the top and save the top limit.</p>
+      <p class="muted">Hold ▲ or ▼ and the blind moves until you let go. The motor finishes one move before it takes the next, so it can hesitate for a moment every second or so; a bigger move size means fewer hesitations. Put the blind where a limit should be, then save it.</p>
       <div class="row">
         <button class="hold" data-hold="up">▲ Hold to move up</button>
         <button class="hold" data-hold="down">▼ Hold to move down</button>
-        <button data-act="stop" class="secondary">Stop</button>
+        <select id="holdsize" style="width:auto"><option value="500" selected>500 steps per move</option><option value="2000">2000 steps per move</option><option value="5000">5000 steps per move</option></select>
       </div>
       <div class="row">
         <span class="muted">Fine-tune:</span>
@@ -818,32 +819,37 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <button data-act="limit-top">Save as top limit</button><button data-act="limit-bottom">Save as bottom limit</button>
       </div>
       <div class="row">
-        <button data-act="range-start" class="secondary">Range start</button><button data-act="range-full" class="secondary">Range full</button>
-        <button data-act="status" class="secondary">Check status</button><button data-act="identify" class="secondary">Identify</button><button data-act="info" class="secondary">Info</button>
+        <button data-act="stop" class="secondary">Stop</button><button data-act="status" class="secondary">Check status</button>
       </div>
       <details>
-        <summary class="muted">Slats (only when setting a venetian up from scratch)</summary>
-        <p class="muted">On a venetian the slats turn with the same motor, so these feel like small moves up and down. They are what TaHoma Pro's "blade tilting" setup sends: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full.</p>
+        <summary class="muted">Setting up from scratch (a motor without limits, configStatus even)</summary>
+        <p class="muted">Range start makes the motor forget its range and accept new limits. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit. On a venetian the slats come next, the way TaHoma Pro's "blade tilting" does it: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full. (On a venetian the slats turn with the same motor, so the slat buttons feel like small moves up and down.)</p>
+        <div class="row">
+          <button data-act="range-start" class="secondary">Range start</button><button data-act="range-full" class="secondary">Range full</button>
+        </div>
         <div class="row">
           <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
           <button data-act="tilt-up" class="secondary">Slats up</button><button data-act="tilt-down" class="secondary">Slats down</button>
+        </div>
+        <div class="row">
+          <button data-act="identify" class="secondary">Identify</button><button data-act="info" class="secondary">Info</button>
         </div>
       </details>
       <p id="note"></p>`;
   }
 
-  // Hold-to-move: a big move command when the button goes down, again every second
-  // while it stays down, and stop the moment it is released.
-  startHold(direction, button) {
+  // Hold-to-move: a move command when the button goes down, offered again while it
+  // stays down, and stop the moment it is released.
+  startHold(direction, button, steps) {
     if (this.holding || !this.motor) return;
-    const hold = { direction, button, busy: false, failed: false, timer: null };
+    const hold = { direction, button, steps, busy: false, failed: false, timer: null };
     this.holding = hold;
     button.classList.add("on");
     const send = () => {
       if (hold.busy || this.holding !== hold) return;
       hold.busy = true;
       this.motor
-        .move(direction, HOLD_STEPS)
+        .move(direction, hold.steps)
         .catch((err) => {
           if (!hold.failed) this.say("error: " + err.message);
           hold.failed = true;
@@ -852,7 +858,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     };
     send();
     hold.timer = setInterval(send, HOLD_REPEAT);
-    this.say(`moving ${direction} while held`);
+    this.say(`moving ${direction} while held (${hold.steps} steps per move)`);
   }
 
   async endHold() {
@@ -881,7 +887,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       b.addEventListener("pointerdown", (ev) => {
         ev.preventDefault();
         b.setPointerCapture(ev.pointerId);
-        this.startHold(b.dataset.hold, b);
+        this.startHold(b.dataset.hold, b, parseInt(view.querySelector("#holdsize").value, 10));
       });
       for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(type, this._release);
       b.addEventListener("contextmenu", (ev) => ev.preventDefault());
