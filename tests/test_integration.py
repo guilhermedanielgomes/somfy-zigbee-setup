@@ -45,6 +45,12 @@ async def test_setup_registers_panel_and_lists_somfy_devices(hass, mqtt_mock, ha
     assert "somfy-zigbee-setup" in panels
     assert panels["somfy-zigbee-setup"].config["_panel_custom"]["module_url"].startswith("/somfy_zigbee_setup_static/panel.js")
 
+    # subscribed at setup, not when a read is pending: Home Assistant passes
+    # subscriptions to the broker a moment after async_subscribe returns, and
+    # a log line answering a read published in between would be lost
+    subscribed = {call.args[0] for call in mqtt_mock.async_subscribe.call_args_list}
+    assert {"zigbee2mqtt/bridge/devices", "zigbee2mqtt/bridge/event", "zigbee2mqtt/bridge/logging"} <= subscribed
+
     async_fire_mqtt_message(hass, "zigbee2mqtt/bridge/devices", json.dumps(DEVICES))
     await hass.async_block_till_done()
 

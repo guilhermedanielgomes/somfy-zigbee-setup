@@ -1,6 +1,7 @@
 {
   "domain": "somfy_zigbee_setup",
   "name": "Somfy Zigbee Setup",
+  "categories": ["blinds_curtains"],
   "codeowners": ["@guilhermedanielgomes"],
   "config_flow": true,
   "dependencies": ["http", "frontend", "websocket_api", "mqtt"],

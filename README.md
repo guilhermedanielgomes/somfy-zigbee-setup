@@ -129,7 +129,7 @@ Over Zigbee the motor is a standard window covering (cluster 258) on endpoint 1.
 
 ## Development
 
-The Home Assistant side has tests (`pip install -r requirements_test.txt`, then `python -m pytest`). The panel is plain JavaScript in `custom_components/somfy_zigbee_setup/frontend/panel.js`, no build step. QR codes are decoded in the browser with [jsQR](https://github.com/cozmo/jsQR) (Apache 2.0, included).
+The Home Assistant side has tests (`pip install -r requirements_test.txt`, then `python -m pytest`). One of them starts a small MQTT broker inside the test and runs a configStatus read through it, because the mocked MQTT in the others delivers messages instantly and hid a timing bug. The panel is plain JavaScript in `custom_components/somfy_zigbee_setup/frontend/panel.js`, no build step. QR codes are decoded in the browser with [jsQR](https://github.com/cozmo/jsQR) (Apache 2.0, included).
 
 ## Credits
 

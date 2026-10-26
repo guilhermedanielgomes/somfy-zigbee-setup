@@ -29,14 +29,20 @@ class Zigbee2MQTT:
         self._unsubs: list[Callable[[], None]] = []
         self._listeners: list[Callable[[dict], None]] = []
         self._reads = 0
+        self._read_lock = asyncio.Lock()
+        self._pending: asyncio.Future[int] | None = None
 
     async def async_start(self) -> None:
-        self._unsubs.append(
-            await mqtt.async_subscribe(self.hass, f"{self.base}/bridge/devices", self._on_devices)
-        )
-        self._unsubs.append(
-            await mqtt.async_subscribe(self.hass, f"{self.base}/bridge/event", self._on_event)
-        )
+        # Home Assistant sends subscriptions to the broker a moment after
+        # async_subscribe returns, so anything we must not miss is subscribed
+        # here, once, and not right before it is needed. The log is where
+        # Zigbee2MQTT reports attribute reads.
+        for topic, handler in (
+            (f"{self.base}/bridge/devices", self._on_devices),
+            (f"{self.base}/bridge/event", self._on_event),
+            (f"{self.base}/bridge/logging", self._on_log),
+        ):
+            self._unsubs.append(await mqtt.async_subscribe(self.hass, topic, handler))
 
     async def async_stop(self) -> None:
         for unsub in self._unsubs:
@@ -67,6 +73,27 @@ class Zigbee2MQTT:
                     "description": (data.get("definition") or {}).get("description"),
                 }
             )
+
+    @callback
+    def _on_log(self, msg: mqtt.ReceiveMessage) -> None:
+        # Only looked at while a read is waiting for its answer
+        if self._pending is None:
+            return
+        payload = _json(msg.payload)
+        if isinstance(payload, dict):
+            found = READ_RESULT.search(str(payload.get("message") or ""))
+            if found:
+                self._deliver(_json(found.group(1)))
+
+    def _deliver(self, result) -> None:
+        future = self._pending
+        if future is None or future.done():
+            return
+        if isinstance(result, dict) and "configStatus" in result:
+            try:
+                future.set_result(int(result["configStatus"]))
+            except (TypeError, ValueError):
+                pass
 
     def _notify(self, event: dict) -> None:
         for listener in list(self._listeners):
@@ -124,53 +151,40 @@ class Zigbee2MQTT:
     async def async_config_status(self, ieee: str) -> int | None:
         """Read configStatus (cluster 258, attribute 7) from endpoint 1.
 
-        Newer Zigbee2MQTT versions publish the result as state when asked to
-        (state_property); older ones only log it, so the log is watched too.
-        Zigbee2MQTT drops a log line identical to the previous one, so the
-        request alternates between one and two attributes.
+        Zigbee2MQTT logs the result ("Read result of '258': {...}"), and
+        newer versions also publish it as state when asked to
+        (state_property). Both are watched. Zigbee2MQTT drops a log line
+        identical to the previous one, so the request alternates between
+        one and two attributes. One read at a time, because the log line
+        does not say which device answered.
         """
-        name = self.friendly_name(ieee)
-        future: asyncio.Future[int] = self.hass.loop.create_future()
+        async with self._read_lock:
+            name = self.friendly_name(ieee)
+            self._pending = self.hass.loop.create_future()
 
-        def done(result) -> None:
-            if isinstance(result, dict) and "configStatus" in result and not future.done():
-                try:
-                    future.set_result(int(result["configStatus"]))
-                except (TypeError, ValueError):
-                    pass
+            @callback
+            def on_state(msg: mqtt.ReceiveMessage) -> None:
+                payload = _json(msg.payload)
+                if isinstance(payload, dict):
+                    self._deliver(payload.get("somfy_config_status"))
 
-        @callback
-        def on_state(msg: mqtt.ReceiveMessage) -> None:
-            payload = _json(msg.payload)
-            if isinstance(payload, dict):
-                done(payload.get("somfy_config_status"))
-
-        @callback
-        def on_log(msg: mqtt.ReceiveMessage) -> None:
-            payload = _json(msg.payload)
-            if isinstance(payload, dict):
-                found = READ_RESULT.search(str(payload.get("message") or ""))
-                if found:
-                    done(_json(found.group(1)))
-
-        unsub_state = await mqtt.async_subscribe(self.hass, f"{self.base}/{name}", on_state)
-        unsub_log = await mqtt.async_subscribe(self.hass, f"{self.base}/bridge/logging", on_log)
-        try:
-            self._reads += 1
-            attributes = [7] if self._reads % 2 else [7, 0]
-            await mqtt.async_publish(
-                self.hass,
-                f"{self.base}/{name}/1/set",
-                json.dumps(
-                    {"read": {"cluster": 258, "attributes": attributes, "state_property": "somfy_config_status"}}
-                ),
-            )
-            return await asyncio.wait_for(future, READ_TIMEOUT)
-        except asyncio.TimeoutError:
-            return None
-        finally:
-            unsub_state()
-            unsub_log()
+            unsub_state = await mqtt.async_subscribe(self.hass, f"{self.base}/{name}", on_state)
+            try:
+                self._reads += 1
+                attributes = [7] if self._reads % 2 else [7, 0]
+                await mqtt.async_publish(
+                    self.hass,
+                    f"{self.base}/{name}/1/set",
+                    json.dumps(
+                        {"read": {"cluster": 258, "attributes": attributes, "state_property": "somfy_config_status"}}
+                    ),
+                )
+                return await asyncio.wait_for(self._pending, READ_TIMEOUT)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                unsub_state()
+                self._pending = None
 
 
 def _json(text: str):
