@@ -341,6 +341,10 @@ const STYLE = `
            background: var(--primary-color); color: var(--text-primary-color, #fff); cursor: pointer; margin: 4px 6px 4px 0; }
   button.secondary { background: transparent; color: var(--primary-color); }
   button:disabled { opacity: .5; cursor: default; }
+  button.hold { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; padding: 14px 18px; }
+  button.hold.on { filter: brightness(1.3); box-shadow: 0 0 0 3px var(--primary-color); }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; }
   input, select { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ccc);
                   background: var(--card-background-color, #fff); color: var(--primary-text-color); width: 100%; box-sizing: border-box; }
   label { display: block; margin: 10px 0 4px; font-size: 14px; }
@@ -356,6 +360,9 @@ const STYLE = `
 `;
 
 const JOIN_TIMEOUT = 180000;
+// Hold-to-move: the biggest move the motor accepts, repeated while the button is held
+const HOLD_STEPS = 500;
+const HOLD_REPEAT = 1000;
 
 class SomfyZigbeeSetupPanel extends HTMLElement {
   constructor() {
@@ -370,6 +377,9 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     this.motor = null;
     this.unsubscribe = null;
     this.pendingJoin = null;
+    this.holding = null;
+    // whatever happens to the page, a held button must not keep the blind moving
+    this._release = () => this.endHold();
   }
 
   set hass(value) {
@@ -394,7 +404,15 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     this.render();
   }
 
+  connectedCallback() {
+    window.addEventListener("blur", this._release);
+    document.addEventListener("visibilitychange", this._release);
+  }
+
   disconnectedCallback() {
+    window.removeEventListener("blur", this._release);
+    document.removeEventListener("visibilitychange", this._release);
+    this.endHold();
     if (this.unsubscribe) this.unsubscribe();
     if (this.motor) this.motor.disconnect();
   }
@@ -452,6 +470,25 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
   async permitJoin() {
     await this._hass.callWS({ type: "somfy_zigbee_setup/permit_join", time: 254 });
     this.say("Permit join is on in Zigbee2MQTT for 4 minutes");
+  }
+
+  async rename(eui64, name) {
+    const result = await this._hass.callWS({ type: "somfy_zigbee_setup/rename", ieee: this.ieeeOf(eui64), name });
+    if (result.status !== "ok") throw new Error(result.error || "Zigbee2MQTT refused the name");
+    this.say(`Named "${name}" in Zigbee2MQTT and Home Assistant`);
+    await new Promise((r) => setTimeout(r, 1000));
+    await this.loadDevices();
+  }
+
+  // A name typed in the wizard goes to Zigbee2MQTT once the motor is there. Not fatal if refused.
+  async renameIfAsked(w) {
+    const existing = this.deviceFor(w.eui64);
+    if (!w.name || (existing && existing.friendly_name === w.name)) return;
+    try {
+      await this.rename(w.eui64, w.name);
+    } catch (err) {
+      this.say(`Could not name it "${w.name}": ${err.message}. You can rename it in Zigbee2MQTT.`);
+    }
   }
 
   async configStatus(eui64) {
@@ -538,7 +575,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       <div class="card"><h2>Events</h2><div class="log">${escapeHtml(this.lines.join("\n"))}</div></div>`;
 
     view.querySelector("#add").onclick = () => {
-      this.wizard = { step: 1, eui64: "", pin: "" };
+      this.wizard = { step: 1, eui64: "", pin: "", name: "" };
       this.view = "wizard";
       this.render();
     };
@@ -579,6 +616,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <label>Photo of the QR code <input type="file" id="qr" accept="image/*" capture="environment"></label>
         <label>EUI64 <input id="eui" placeholder="4CC206FFFE0A1B2C" value="${escapeHtml(w.eui64)}"></label>
         <label>Pin Code <input id="pin" placeholder="6 characters" maxlength="6" value="${escapeHtml(w.pin)}"></label>
+        <label>Name in Home Assistant (optional) <input id="name" placeholder="Kitchen blind" maxlength="80" value="${escapeHtml(w.name || "")}"></label>
         <p class="muted" id="qrnote"></p>
         <div class="row"><button id="next">Next</button><button id="cancel" class="secondary">Cancel</button></div>`;
     } else if (w.step === 2) {
@@ -647,6 +685,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         if (!/^[0-9A-F]{6}$/.test(pin)) return alert("The Pin Code is the 6 characters printed on the sticker.");
         w.eui64 = eui64;
         w.pin = pin;
+        w.name = view.querySelector("#name").value.trim();
         w.step = 2;
         this.render();
       };
@@ -696,7 +735,8 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     if (w.step === 3) {
       const skip = view.querySelector("#skip");
       if (skip)
-        skip.onclick = () => {
+        skip.onclick = async () => {
+          await this.renameIfAsked(w);
           w.step = 4;
           this.render();
           this.runStatus();
@@ -717,6 +757,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
             return;
           }
           await this.loadDevices();
+          await this.renameIfAsked(w);
           w.step = 4;
           this.render();
           this.runStatus();
@@ -762,25 +803,70 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
 
   calibrationControls() {
     return `
-      <p class="muted">Fine-tuning: move the blind with the arrows, then save the position as a limit. From scratch (configStatus even): Range start, move down to the bottom and save it, move up to the top and save it, then Range full. Use small steps near the ends.</p>
+      <p class="muted">Hold ▲ or ▼ to move the blind; it stops when you let go. Put the blind where a limit should be, then save it. From scratch (configStatus even): Range start, hold ▼ to the bottom and save the bottom limit, hold ▲ to the top and save the top limit.</p>
       <div class="row">
-        <select id="step"><option value="100">100 steps</option><option value="20">20 steps</option><option value="5">5 steps</option></select>
-        <button data-act="up">▲ Up</button><button data-act="down">▼ Down</button>
+        <button class="hold" data-hold="up">▲ Hold to move up</button>
+        <button class="hold" data-hold="down">▼ Hold to move down</button>
         <button data-act="stop" class="secondary">Stop</button>
-        <button data-act="identify" class="secondary">Identify</button>
       </div>
       <div class="row">
-        <select id="tstep"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
-        <button data-act="tilt-up">Slats up</button><button data-act="tilt-down">Slats down</button>
+        <span class="muted">Fine-tune:</span>
+        <button data-act="nudge-up" class="secondary">▲ a little</button><button data-act="nudge-down" class="secondary">▼ a little</button>
+        <select id="step" style="width:auto"><option value="5">5 steps</option><option value="20" selected>20 steps</option><option value="100">100 steps</option></select>
       </div>
       <div class="row">
         <button data-act="limit-top">Save as top limit</button><button data-act="limit-bottom">Save as bottom limit</button>
       </div>
       <div class="row">
         <button data-act="range-start" class="secondary">Range start</button><button data-act="range-full" class="secondary">Range full</button>
-        <button data-act="status" class="secondary">Check status</button><button data-act="info" class="secondary">Info</button>
+        <button data-act="status" class="secondary">Check status</button><button data-act="identify" class="secondary">Identify</button><button data-act="info" class="secondary">Info</button>
       </div>
+      <details>
+        <summary class="muted">Slats (only when setting a venetian up from scratch)</summary>
+        <p class="muted">On a venetian the slats turn with the same motor, so these feel like small moves up and down. They are what TaHoma Pro's "blade tilting" setup sends: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full.</p>
+        <div class="row">
+          <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
+          <button data-act="tilt-up" class="secondary">Slats up</button><button data-act="tilt-down" class="secondary">Slats down</button>
+        </div>
+      </details>
       <p id="note"></p>`;
+  }
+
+  // Hold-to-move: a big move command when the button goes down, again every second
+  // while it stays down, and stop the moment it is released.
+  startHold(direction, button) {
+    if (this.holding || !this.motor) return;
+    const hold = { direction, button, busy: false, failed: false, timer: null };
+    this.holding = hold;
+    button.classList.add("on");
+    const send = () => {
+      if (hold.busy || this.holding !== hold) return;
+      hold.busy = true;
+      this.motor
+        .move(direction, HOLD_STEPS)
+        .catch((err) => {
+          if (!hold.failed) this.say("error: " + err.message);
+          hold.failed = true;
+        })
+        .finally(() => (hold.busy = false));
+    };
+    send();
+    hold.timer = setInterval(send, HOLD_REPEAT);
+    this.say(`moving ${direction} while held`);
+  }
+
+  async endHold() {
+    const hold = this.holding;
+    if (!hold) return;
+    this.holding = null;
+    clearInterval(hold.timer);
+    hold.button.classList.remove("on");
+    try {
+      await this.motor.stop();
+      this.say("stop sent");
+    } catch (err) {
+      this.say("error: " + err.message);
+    }
   }
 
   wireCalibration(view, eui64) {
@@ -791,6 +877,15 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         el.className = cls;
       }
     };
+    view.querySelectorAll("[data-hold]").forEach((b) => {
+      b.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        b.setPointerCapture(ev.pointerId);
+        this.startHold(b.dataset.hold, b);
+      });
+      for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(type, this._release);
+      b.addEventListener("contextmenu", (ev) => ev.preventDefault());
+    });
     view.querySelectorAll("[data-act]").forEach((b) => {
       b.onclick = async () => {
         const act = b.dataset.act;
@@ -799,9 +894,10 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         try {
           if (act === "status") return void (await this.configStatus(eui64));
           const m = this.motor;
-          if (act === "up" || act === "down") {
-            await m.move(act, steps);
-            this.say(`moving ${act} (${steps})`);
+          if (act === "nudge-up" || act === "nudge-down") {
+            const direction = act.slice(6);
+            await m.move(direction, steps);
+            this.say(`moving ${direction} (${steps} steps)`);
           } else if (act === "tilt-up" || act === "tilt-down") {
             await m.tilt(act.slice(5), tsteps);
             this.say(`tilting ${act.slice(5)} (${tsteps})`);
@@ -887,7 +983,8 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     }
   }
 
-  goHome() {
+  async goHome() {
+    await this.endHold();
     if (this.motor) this.motor.disconnect();
     this.motor = null;
     this.wizard = null;

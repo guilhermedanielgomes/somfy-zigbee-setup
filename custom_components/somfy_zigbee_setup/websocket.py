@@ -42,6 +42,19 @@ async def ws_config_status(hass: HomeAssistant, connection: websocket_api.Active
 
 
 @websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/rename",
+        vol.Required("ieee"): str,
+        vol.Required("name"): vol.All(str, vol.Strip, vol.Length(min=1, max=80)),
+    }
+)
+@websocket_api.async_response
+async def ws_rename(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    connection.send_result(msg["id"], await _bridge(hass).async_rename(msg["ieee"], msg["name"]))
+
+
+@websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/subscribe_events"})
 @callback
 def ws_subscribe_events(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
@@ -55,5 +68,5 @@ def ws_subscribe_events(hass: HomeAssistant, connection: websocket_api.ActiveCon
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for command in (ws_devices, ws_permit_join, ws_config_status, ws_subscribe_events):
+    for command in (ws_devices, ws_permit_join, ws_config_status, ws_rename, ws_subscribe_events):
         websocket_api.async_register_command(hass, command)

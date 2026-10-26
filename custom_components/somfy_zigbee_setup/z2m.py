@@ -11,7 +11,7 @@ from collections.abc import Callable
 from homeassistant.components import mqtt
 from homeassistant.core import HomeAssistant, callback
 
-from .const import READ_TIMEOUT
+from .const import READ_TIMEOUT, RENAME_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +31,8 @@ class Zigbee2MQTT:
         self._reads = 0
         self._read_lock = asyncio.Lock()
         self._pending: asyncio.Future[int] | None = None
+        self._renames: dict[str, asyncio.Future[dict]] = {}
+        self._transactions = 0
 
     async def async_start(self) -> None:
         # Home Assistant sends subscriptions to the broker a moment after
@@ -41,6 +43,7 @@ class Zigbee2MQTT:
             (f"{self.base}/bridge/devices", self._on_devices),
             (f"{self.base}/bridge/event", self._on_event),
             (f"{self.base}/bridge/logging", self._on_log),
+            (f"{self.base}/bridge/response/device/rename", self._on_rename),
         ):
             self._unsubs.append(await mqtt.async_subscribe(self.hass, topic, handler))
 
@@ -84,6 +87,15 @@ class Zigbee2MQTT:
             found = READ_RESULT.search(str(payload.get("message") or ""))
             if found:
                 self._deliver(_json(found.group(1)))
+
+    @callback
+    def _on_rename(self, msg: mqtt.ReceiveMessage) -> None:
+        payload = _json(msg.payload)
+        if not isinstance(payload, dict):
+            return
+        future = self._renames.get(str(payload.get("transaction")))
+        if future is not None and not future.done():
+            future.set_result(payload)
 
     def _deliver(self, result) -> None:
         future = self._pending
@@ -147,6 +159,38 @@ class Zigbee2MQTT:
         await mqtt.async_publish(
             self.hass, f"{self.base}/bridge/request/permit_join", json.dumps({"time": seconds})
         )
+
+    async def async_rename(self, ieee: str, name: str) -> dict:
+        """Give the device a friendly name in Zigbee2MQTT (and so in Home Assistant).
+
+        Returns {"status": "ok"} or {"status": "error", "error": "..."} as
+        Zigbee2MQTT answers; it checks the name itself (no '#', '+', '/', unique).
+        """
+        self._transactions += 1
+        transaction = f"somfy-{self._transactions}"
+        future: asyncio.Future[dict] = self.hass.loop.create_future()
+        self._renames[transaction] = future
+        try:
+            await mqtt.async_publish(
+                self.hass,
+                f"{self.base}/bridge/request/device/rename",
+                json.dumps(
+                    {
+                        "from": self.friendly_name(ieee),
+                        "to": name,
+                        "homeassistant_rename": True,
+                        "transaction": transaction,
+                    }
+                ),
+            )
+            answer = await asyncio.wait_for(future, RENAME_TIMEOUT)
+        except asyncio.TimeoutError:
+            return {"status": "error", "error": "Zigbee2MQTT did not answer"}
+        finally:
+            self._renames.pop(transaction, None)
+        if answer.get("status") == "ok":
+            return {"status": "ok"}
+        return {"status": "error", "error": str(answer.get("error") or "Zigbee2MQTT refused the name")}
 
     async def async_config_status(self, ieee: str) -> int | None:
         """Read configStatus (cluster 258, attribute 7) from endpoint 1.

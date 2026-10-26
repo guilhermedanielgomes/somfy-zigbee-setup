@@ -49,7 +49,8 @@ async def test_setup_registers_panel_and_lists_somfy_devices(hass, mqtt_mock, ha
     # subscriptions to the broker a moment after async_subscribe returns, and
     # a log line answering a read published in between would be lost
     subscribed = {call.args[0] for call in mqtt_mock.async_subscribe.call_args_list}
-    assert {"zigbee2mqtt/bridge/devices", "zigbee2mqtt/bridge/event", "zigbee2mqtt/bridge/logging"} <= subscribed
+    assert {"zigbee2mqtt/bridge/devices", "zigbee2mqtt/bridge/event", "zigbee2mqtt/bridge/logging",
+            "zigbee2mqtt/bridge/response/device/rename"} <= subscribed
 
     async_fire_mqtt_message(hass, "zigbee2mqtt/bridge/devices", json.dumps(DEVICES))
     await hass.async_block_till_done()
@@ -116,6 +117,35 @@ async def test_config_status_read(hass, mqtt_mock, hass_ws_client, via):
     reply = await client.receive_json()
     await task
     assert reply["success"] and reply["result"] == {"config_status": 127}
+
+
+@pytest.mark.parametrize("answer", ["ok", "error"])
+async def test_rename(hass, mqtt_mock, hass_ws_client, answer):
+    await setup_integration(hass, mqtt_mock)
+    async_fire_mqtt_message(hass, "zigbee2mqtt/bridge/devices", json.dumps(DEVICES))
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+
+    async def z2m_answers():
+        await asyncio.sleep(0.2)
+        topic, payload = mqtt_mock.async_publish.call_args[0][:2]
+        assert topic == "zigbee2mqtt/bridge/request/device/rename"
+        request = json.loads(payload)
+        assert request["from"] == "Office blind" and request["to"] == "Kitchen" and request["homeassistant_rename"] is True
+        response = {"data": {"from": "Office blind", "to": "Kitchen"}, "status": "ok", "transaction": request["transaction"]}
+        if answer == "error":
+            response = {"data": {}, "status": "error", "error": "Device 'Kitchen' already exists", "transaction": request["transaction"]}
+        async_fire_mqtt_message(hass, "zigbee2mqtt/bridge/response/device/rename", json.dumps(response))
+
+    await client.send_json({"id": 1, "type": f"{DOMAIN}/rename", "ieee": IEEE, "name": " Kitchen "})
+    task = hass.async_create_task(z2m_answers())
+    reply = await client.receive_json()
+    await task
+    assert reply["success"]
+    if answer == "ok":
+        assert reply["result"] == {"status": "ok"}
+    else:
+        assert reply["result"] == {"status": "error", "error": "Device 'Kitchen' already exists"}
 
 
 async def test_unload(hass, mqtt_mock):

@@ -41,7 +41,9 @@ Then Settings > Devices & services > Add integration > **Somfy Zigbee Setup**. T
 
 ### Using it
 
-The page lists the Somfy motors Zigbee2MQTT knows, with a **Check calibration** button (reads `configStatus`, see below) and a **Calibrate** button. **Add a blind** is the wizard: type the EUI64 and Pin Code or scan the sticker's QR code, connect over Bluetooth (the browser shows the Somfy motors it can hear, pick any, the page checks it is the right one and jogs it), then it turns on permit join, makes the motor leave its network, waits for Zigbee2MQTT to report the join, reads `configStatus` and, if needed, takes you to the calibration buttons.
+The page lists the Somfy motors Zigbee2MQTT knows, with a **Check calibration** button (reads `configStatus`, see below) and a **Calibrate** button. **Add a blind** is the wizard: type the EUI64 and Pin Code or scan the sticker's QR code, give the blind a name if you like (it becomes its name in Zigbee2MQTT and Home Assistant), connect over Bluetooth (the browser shows the Somfy motors it can hear, pick any, the page checks it is the right one and jogs it), then it turns on permit join, makes the motor leave its network, waits for Zigbee2MQTT to report the join, reads `configStatus` and, if needed, takes you to the calibration buttons.
+
+The browser's Bluetooth list shows the names TaHoma Pro gave the motors, or `Sonesse2 40 Zigbee` for the ones it never named. It does not matter which you pick, the page reads the EUI64 from the motor and refuses the wrong one.
 
 The Bluetooth commands are the same ones the command line tool sends, byte for byte. Home Assistant itself never uses Bluetooth; it only publishes and listens on MQTT.
 
@@ -80,7 +82,13 @@ You can also run the steps on their own:
 
 ## Calibration
 
-Same buttons on the Home Assistant page, same commands at the tool's `somfy>` prompt. The limits live in the motor. You can change them while the blind stays paired with Zigbee2MQTT, and Zigbee2MQTT keeps controlling it meanwhile. The tool's commands:
+The limits live in the motor. You can change them while the blind stays paired with Zigbee2MQTT, and Zigbee2MQTT keeps controlling it meanwhile.
+
+On the Home Assistant page: hold **▲** or **▼** and the blind moves until you let go (the page sends a stop the moment the button is released, also if the page loses focus). The **a little** buttons move by a few steps for the last millimetres. Put the blind where the limit should be and press **Save as top limit** or **Save as bottom limit**. From scratch: **Range start**, hold ▼ to the bottom, save it, hold ▲ to the top, save it. The slat buttons are folded away because on a venetian they feel like small up and down moves; they are only for TaHoma Pro's "blade tilting" setup of a motor that has no tilt range yet (Range start, slats closed one way, slats closed the other way, Range full).
+
+TaHoma Pro also asks for an intermediate position (the "my" position of Somfy remotes). Zigbee2MQTT can send the blind to any position, so there is nothing to store and the page does not ask.
+
+The same commands at the tool's `somfy>` prompt:
 
     identify                     jog the motor once
     status                       ask Zigbee2MQTT whether the motor is calibrated
@@ -117,7 +125,7 @@ On my blinds the slats turn during the first part of every movement, and the mot
 - Somfy Sonesse2 40 Zigbee on a venetian blind, firmware `5170183A07.6C14BC12` (TaHoma Pro showed it as A009)
 - Zigbee2MQTT 2.7 (Home Assistant add-on), Sonoff Zigbee USB dongle, Mosquitto add-on
 - The tool: macOS 15 on a MacBook, Python 3.8 with bleak 0.22.3; also Python 3.13 with bleak 3.0
-- The integration: Chrome on macOS and Android
+- The integration: Chrome on macOS; Android still to confirm
 
 Other Sonesse2 Zigbee motors use the same Bluetooth commands, so they should work, but I have only tried mine. If you try another model, open an issue and say what happened.
 
