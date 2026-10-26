@@ -207,7 +207,7 @@ class Motor:
             print("No Somfy motor found. Close the TaHoma Pro app on your phone and move closer.")
             return False
 
-        motors.sort(key=lambda m: m[0], reverse=True)
+        motors.sort(key=lambda m: m[0] if m[0] != 127 else -999, reverse=True)
         for rssi, dev in motors:
             print(f"Checking {dev.name or 'unnamed'} (signal {rssi} dBm)")
             try:
@@ -319,6 +319,8 @@ class Zigbee2MQTT:
         self.inbox = queue.Queue()
         self.devices = []
         self.connected = threading.Event()
+        self.refused = None
+        self.reads = 0
         try:
             self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         except AttributeError:  # paho-mqtt 1.x
@@ -334,13 +336,24 @@ class Zigbee2MQTT:
         self.client.loop_start()
         if not self.connected.wait(10):
             self.close()
-            raise RuntimeError("the MQTT broker did not accept the connection - check the username and password")
+            raise RuntimeError(f"nothing answered like an MQTT broker at {host}:{port} - "
+                               "MQTT is usually on port 1883 (8123 is Home Assistant's web page)")
+        if self.refused:
+            self.close()
+            raise RuntimeError(f"the MQTT broker refused the login ({self.refused}) - check the username and password")
         time.sleep(1)  # let the retained device list arrive
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        client.subscribe(f"{self.base}/bridge/event")
-        client.subscribe(f"{self.base}/bridge/devices")
-        client.subscribe(f"{self.base}/+")
+        failed = getattr(rc, "is_failure", None)  # paho 2.x gives a reason code object
+        if failed is None:
+            failed = rc != 0  # paho 1.x gives a number, 0 means accepted
+        if failed:
+            self.refused = str(rc)
+        else:
+            client.subscribe(f"{self.base}/bridge/event")
+            client.subscribe(f"{self.base}/bridge/devices")
+            client.subscribe(f"{self.base}/bridge/logging")
+            client.subscribe(f"{self.base}/+")
         self.connected.set()
 
     def _on_message(self, client, userdata, msg):
@@ -416,13 +429,20 @@ class Zigbee2MQTT:
         return False
 
     def config_status(self, eui64, timeout=15):
-        """Read configStatus from endpoint 1. Returns the number, or None."""
+        """Read configStatus from endpoint 1. Returns the number, or None.
+
+        Newer Zigbee2MQTT versions publish the result as state when asked to
+        (state_property); older ones only log it, so the log is watched too.
+        """
         dev = self.device(eui64)
         name = dev["friendly_name"] if dev else self.ieee(eui64)
+        # Zigbee2MQTT drops a log line identical to the previous one, so alternate the request
+        self.reads += 1
+        attributes = [7] if self.reads % 2 else [7, 0]
         self.drain()
         self.client.publish(
             f"{self.base}/{name}/1/set",
-            json.dumps({"read": {"cluster": 258, "attributes": [7], "state_property": "config_status"}}),
+            json.dumps({"read": {"cluster": 258, "attributes": attributes, "state_property": "config_status"}}),
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -430,10 +450,20 @@ class Zigbee2MQTT:
             if msg is None:
                 continue
             topic, payload = msg
-            if topic == f"{self.base}/{name}" and isinstance(payload, dict):
+            if not isinstance(payload, dict):
+                continue
+            result = None
+            if topic == f"{self.base}/{name}":
                 result = payload.get("config_status")
-                if isinstance(result, dict) and "configStatus" in result:
-                    return int(result["configStatus"])
+            elif topic == f"{self.base}/bridge/logging":
+                found = re.search(r"Read result of '258': (\{.*\})", payload.get("message", ""))
+                if found:
+                    try:
+                        result = json.loads(found.group(1))
+                    except ValueError:
+                        result = None
+            if isinstance(result, dict) and "configStatus" in result:
+                return int(result["configStatus"])
         return None
 
 
@@ -675,7 +705,7 @@ async def run_guided(args):
         elif await yes_no("Can I talk to your MQTT broker to turn on permit join and watch the motor join?"):
             args.mqtt_host = await ask("Broker host or IP (e.g. 192.168.1.10): ")
             port = await ask("Port [1883]: ")
-            args.mqtt_port = int(port) if port else 1883
+            args.mqtt_port = int(port) if port.isdigit() else 1883
             args.mqtt_user = await ask("Username (Enter if none): ") or None
             args.mqtt_password = await ask("Password (Enter if none): ") or None
             try:
@@ -686,6 +716,8 @@ async def run_guided(args):
 
         if z2m is not None and z2m.device(eui64) is not None:
             print(f"\nThis motor is already in Zigbee2MQTT as '{z2m.device(eui64)['friendly_name']}'.")
+            paired = True
+        elif z2m is None and await yes_no("\nIs this motor already in Zigbee2MQTT?"):
             paired = True
         else:
             print("\nStep 1: pairing with Zigbee2MQTT")
