@@ -19,7 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.somfy_zigbee_setup.const import DOMAIN
 
-IEEE = "0x4cc206fffe7012b2"
+IEEE = "0x4cc206fffe0a1b2c"
 DEVICES = [
     {"ieee_address": "0x00124b0012345678", "friendly_name": "Coordinator", "type": "Coordinator"},
     {"ieee_address": IEEE, "friendly_name": IEEE, "type": "Router", "manufacturer": "SOMFY",

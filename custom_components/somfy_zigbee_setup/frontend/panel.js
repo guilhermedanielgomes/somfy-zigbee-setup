@@ -360,6 +360,9 @@ const STYLE = `
 `;
 
 const JOIN_TIMEOUT = 180000;
+// A motor Zigbee2MQTT already knows is not interviewed again, it only announces itself;
+// a new one is interviewed right after joining. Wait this long for an interview to start.
+const INTERVIEW_GRACE = 15000;
 // Hold-to-move: the motor finishes one move before it takes the next, so while the
 // button is held the move is offered again every 150 ms and the motor picks it up
 // as soon as it is free. On a Sonesse2 40, 500 steps is about a second of travel.
@@ -440,11 +443,19 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     if (event.type === "device_interview" && event.status === "failed") this.say(`${who}: the interview failed`);
     if (event.type === "device_announce") this.say(`${who} is back on the network`);
     if (event.type === "device_leave") this.say(`${who} left the network`);
-    if (this.pendingJoin && event.ieee === this.pendingJoin.ieee) {
-      if ((event.type === "device_interview" && event.status === "successful") || event.type === "device_announce") {
-        this.pendingJoin.resolve(true);
+    const p = this.pendingJoin;
+    if (p && event.ieee === p.ieee) {
+      if (event.type === "device_interview" && event.status === "successful") {
+        p.resolve(true);
       } else if (event.type === "device_interview" && event.status === "failed") {
-        this.pendingJoin.resolve(false);
+        p.resolve(false);
+      } else if (event.type === "device_interview") {
+        // started: the page keeps quiet until Zigbee2MQTT is done with the motor
+        clearTimeout(p.grace);
+        p.grace = null;
+      } else if (event.type === "device_joined" || event.type === "device_announce") {
+        clearTimeout(p.grace);
+        p.grace = setTimeout(() => p.resolve(true), INTERVIEW_GRACE);
       }
     }
   }
@@ -514,14 +525,17 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         this.pendingJoin = null;
         resolve(false);
       }, JOIN_TIMEOUT);
-      this.pendingJoin = {
+      const pending = {
         ieee: this.ieeeOf(eui64),
+        grace: null,
         resolve: (ok) => {
           clearTimeout(timer);
+          clearTimeout(pending.grace);
           this.pendingJoin = null;
           resolve(ok);
         },
       };
+      this.pendingJoin = pending;
     });
   }
 
