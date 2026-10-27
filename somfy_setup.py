@@ -163,6 +163,18 @@ def is_my_motor(value, eui64):
     return eui64 in (eui.hex().upper(), eui[::-1].hex().upper())
 
 
+def advertised_eui48(adv):
+    """The motors put their Bluetooth address in the advertisement: bytes 1 to 6
+    of the Somfy manufacturer data, last byte first."""
+    data = bytes(adv.manufacturer_data.get(SOMFY, b""))
+    return data[6:0:-1].hex().upper() if len(data) >= 7 else None
+
+
+def eui48_of(eui64):
+    """A Sonesse2 motor's Bluetooth address is its EUI64 without the FFFE in the middle."""
+    return eui64[:6] + eui64[10:] if eui64[6:10] == "FFFE" else None
+
+
 async def read_eui(client):
     try:
         return await client.read_gatt_char(EUI)
@@ -208,6 +220,12 @@ class Motor:
             return False
 
         motors.sort(key=lambda m: m[0] if m[0] != 127 else -999, reverse=True)
+        # the advertisement says which motor is which, so try the sticker's one first
+        mine = eui48_of(self.eui64)
+        advertised = {dev.address: advertised_eui48(adv) for dev, adv in found.values()}
+        motors.sort(key=lambda m: advertised.get(m[1].address) != mine)
+        if mine and advertised.get(motors[0][1].address) == mine:
+            print(f"The sticker's motor is advertising as {motors[0][1].name or 'unnamed'}")
         for rssi, dev in motors:
             print(f"Checking {dev.name or 'unnamed'} (signal {rssi} dBm)")
             try:

@@ -43,7 +43,7 @@ Then Settings > Devices & services > Add integration > **Somfy Zigbee Setup**. T
 
 The page lists the Somfy motors Zigbee2MQTT knows, with a **Check calibration** button (reads `configStatus`, see below) and a **Calibrate** button. **Add a blind** is the wizard: type the EUI64 and Pin Code or scan the sticker's QR code, give the blind a name if you like (it becomes its name in Zigbee2MQTT and Home Assistant), connect over Bluetooth (the browser shows the Somfy motors it can hear, pick any, the page checks it is the right one and jogs it), then it turns on permit join, makes the motor leave its network, waits for Zigbee2MQTT to report the join, reads `configStatus` and, if needed, takes you to the calibration buttons.
 
-The browser's Bluetooth list shows the names TaHoma Pro gave the motors, or `Sonesse2 40 Zigbee` for the ones it never named. It does not matter which you pick, the page reads the EUI64 from the motor and refuses the wrong one.
+The browser's Bluetooth list normally shows one motor, the one from the sticker: the motors put their Bluetooth address in what they broadcast, and that address is the EUI64 without the `FFFE` in the middle, so the page asks the browser to list only that one. If the list stays empty (out of range, or a motor that broadcasts differently), **Show all Somfy motors** lists every motor nearby under the names TaHoma Pro gave them, or `Sonesse2` for the ones it never named. Pick any: the page reads the EUI64 from the motor and tells you when it is not the one from the sticker, and **Set up "..." instead** lets you keep the motor you picked and go find its sticker by the EUI64 instead.
 
 The Bluetooth commands are the same ones the command line tool sends, byte for byte. Home Assistant itself never uses Bluetooth; it only publishes and listens on MQTT.
 
@@ -66,7 +66,7 @@ Close the TaHoma Pro app on your phone first. The motor takes one Bluetooth conn
 Run the tool with no arguments near the blind and it walks you through it:
 
 1. It asks for the EUI64 and Pin Code, or for a photo of the QR code on the sticker.
-2. It scans for Somfy motors, connects to each one and reads its EUI64, so the commands only ever go to the blind on your sticker. Then it jogs the blind so you can confirm it is the right one.
+2. It scans for Somfy motors and picks the sticker's one by the address in its broadcast, then connects and reads its EUI64 to be sure, so the commands only ever go to the blind on your sticker. Then it jogs the blind so you can confirm it is the right one.
 3. If you give it your MQTT broker, it turns on permit join in Zigbee2MQTT, makes the motor leave its network, and waits for Zigbee2MQTT to report the join. Without the broker it tells you what to do by hand.
 4. It reads the motor's `configStatus`. An odd number means the limits are there and the blind will move. An even number means the motor has no limits: it will acknowledge every command and ignore it. That is not a Zigbee2MQTT problem, the motor needs calibrating.
 5. If needed, it takes you into the calibration prompt (next section).
@@ -134,6 +134,8 @@ Other Sonesse2 Zigbee motors use the same Bluetooth commands, so they should wor
 The Bluetooth protocol is Somfy's own, found by [Melair](https://mrmelair.com/2024/07/10/hacking-the-somfy-sonesse2-zigbee-motors/) by taking the TaHoma Pro Android app apart. The PIN from the sticker is written to one characteristic, then each command is a write to another one: leave network, move up or down by n steps, save the limit at the current position, start or finish the range setup. This tool only sends those. It has no factory reset and does not touch the motor's firmware or configuration files.
 
 Over Zigbee the motor is a standard window covering (cluster 258) on endpoint 1. `configStatus` is attribute 7 of that cluster and its lowest bit means "operational".
+
+The Bluetooth advertisement carries Somfy's company id (1480) and 9 bytes of manufacturer data; bytes 1 to 6 are the motor's Bluetooth address, last byte first. The motor also advertises its name, the one given in TaHoma Pro, which is stored in the motor.
 
 ## Development
 

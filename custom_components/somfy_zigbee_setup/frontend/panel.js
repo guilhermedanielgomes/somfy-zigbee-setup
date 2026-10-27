@@ -144,9 +144,23 @@ export class Motor {
     return !!(navigator.bluetooth && window.isSecureContext);
   }
 
-  async choose() {
+  // The motors put their Bluetooth address in the advertisement (bytes 1 to 6,
+  // last byte first), and that address is the EUI64 without the FFFE in the
+  // middle. With this filter the browser's list shows only the sticker's motor.
+  static filterFor(eui64) {
+    if (!/^[0-9A-F]{6}FFFE[0-9A-F]{6}$/.test(eui64 || "")) return null;
+    const mac = (eui64.slice(0, 6) + eui64.slice(10)).match(/../g).map((h) => parseInt(h, 16)).reverse();
+    return {
+      companyIdentifier: SOMFY_COMPANY_ID,
+      dataPrefix: Uint8Array.from([0, ...mac]),
+      mask: Uint8Array.from([0, 255, 255, 255, 255, 255, 255]),
+    };
+  }
+
+  async choose(onlyMine = true) {
+    const mine = onlyMine ? Motor.filterFor(this.eui64) : null;
     this.device = await navigator.bluetooth.requestDevice({
-      filters: [{ manufacturerData: [{ companyIdentifier: SOMFY_COMPANY_ID }] }],
+      filters: [{ manufacturerData: [mine || { companyIdentifier: SOMFY_COMPANY_ID }] }],
       optionalServices: Object.values(SERVICE),
     });
     this.device.addEventListener("gattserverdisconnected", () => {
@@ -248,11 +262,12 @@ export class Motor {
     }
     if (eui !== null && eui !== this.eui64) {
       this.foundEui = eui;
-      this.server.disconnect();
+      this.foundName = this.device.name || "";
+      this.disconnect();
       return "other";
     }
     if (!loggedIn && !(await this.login())) {
-      this.server.disconnect();
+      this.disconnect();
       return "refused";
     }
     this.verified = true;
@@ -322,6 +337,7 @@ export class Motor {
   disconnect() {
     this.expectDrop = true;
     if (this.device && this.device.gatt.connected) this.device.gatt.disconnect();
+    setTimeout(() => (this.expectDrop = false), 3000);
   }
 }
 
@@ -345,6 +361,7 @@ const STYLE = `
   button.hold.on { filter: brightness(1.3); box-shadow: 0 0 0 3px var(--primary-color); }
   details { margin-top: 12px; }
   summary { cursor: pointer; }
+  ol { padding-left: 20px; } ol li { margin: 4px 0; }
   input, select { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ccc);
                   background: var(--card-background-color, #fff); color: var(--primary-text-color); width: 100%; box-sizing: border-box; }
   label { display: block; margin: 10px 0 4px; font-size: 14px; }
@@ -582,7 +599,6 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       <div class="card">
         <div class="row">
           <button id="add" ${Motor.available() ? "" : "disabled"}>Add a blind</button>
-          <button id="permit" class="secondary">Permit join (4 min)</button>
           <button id="reload" class="secondary">Refresh</button>
         </div>
       </div>
@@ -594,7 +610,6 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       this.view = "wizard";
       this.render();
     };
-    view.querySelector("#permit").onclick = () => this.permitJoin().catch((e) => this.say(e.message));
     view.querySelector("#reload").onclick = () => this.loadDevices().then(() => this.render());
     view.querySelectorAll("[data-check]").forEach((b) => {
       b.onclick = async () => {
@@ -632,12 +647,12 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <label>EUI64 <input id="eui" placeholder="4CC206FFFE0A1B2C" value="${escapeHtml(w.eui64)}"></label>
         <label>Pin Code <input id="pin" placeholder="6 characters" maxlength="6" value="${escapeHtml(w.pin)}"></label>
         <label>Name in Home Assistant (optional) <input id="name" placeholder="Kitchen blind" maxlength="80" value="${escapeHtml(w.name || "")}"></label>
-        <p class="muted" id="qrnote"></p>
+        <p class="muted" id="qrnote">${escapeHtml(w.hint || "")}</p>
         <div class="row"><button id="next">Next</button><button id="cancel" class="secondary">Cancel</button></div>`;
     } else if (w.step === 2) {
       body = `
-        <p>Close the TaHoma Pro app on your phone first (the motor takes one Bluetooth connection at a time), stand near the blind and press the button. Your browser shows the Somfy motors it can hear; pick any, the page checks it is the one from the sticker.</p>
-        <div class="row"><button id="connect">Connect over Bluetooth</button><button id="cancel" class="secondary">Cancel</button></div>
+        <p>Close the TaHoma Pro app on your phone first (the motor takes one Bluetooth connection at a time), stand near the blind and press the button. Your browser lists the motor from the sticker when it can hear it; pick it and press Pair.</p>
+        <div class="row"><button id="connect">Connect over Bluetooth</button><button id="showall" class="secondary" hidden>Show all Somfy motors</button><button id="useit" class="secondary" hidden></button><button id="cancel" class="secondary">Cancel</button></div>
         <p id="note"></p>
         <div id="jog" hidden><p>The blind should have jogged just now. Did it?</p>
           <div class="row"><button id="yes">Yes</button><button id="no" class="secondary">No</button></div></div>`;
@@ -701,22 +716,55 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         w.eui64 = eui64;
         w.pin = pin;
         w.name = view.querySelector("#name").value.trim();
+        w.hint = "";
         w.step = 2;
         this.render();
       };
     }
 
     if (w.step === 2) {
+      view.querySelector("#showall").onclick = () => {
+        w.showAll = true;
+        view.querySelector("#showall").hidden = true;
+        view.querySelector("#connect").click();
+      };
       view.querySelector("#connect").onclick = async () => {
         const button = view.querySelector("#connect");
         button.disabled = true;
         try {
           this.motor = new Motor(w.eui64, w.pin, (t) => this.say(t));
-          await this.motor.choose();
+          try {
+            await this.motor.choose(!w.showAll);
+          } catch (err) {
+            if (err.name === "NotFoundError" && !w.showAll) {
+              // the chooser was closed without a pick, usually because the list stayed empty
+              note("Nothing picked. If the list stayed empty, move closer to the blind and try again, or show all the Somfy motors nearby and pick by name.");
+              view.querySelector("#showall").hidden = false;
+              button.disabled = false;
+              return;
+            }
+            throw err;
+          }
           note("Connecting...");
           const result = await this.motor.ensure();
           if (result === "other") {
-            note(`That is a different motor (EUI64 ${this.motor.foundEui}). Press the button again and pick another one.`, "bad");
+            note(this.wrongMotor(w), "bad");
+            // or keep the motor just picked (the one you are standing next to) and
+            // find its sticker by the EUI64 instead of finding its name by the sticker
+            const picked = this.motor.foundName || "that motor";
+            const eui = this.motor.foundEui;
+            const use = view.querySelector("#useit");
+            use.textContent = `Set up "${picked}" instead`;
+            use.hidden = false;
+            use.onclick = () => {
+              w.eui64 = eui;
+              w.pin = "";
+              w.tried = [];
+              w.hint = `This is "${picked}", EUI64 ${eui}. Type the Pin Code from the sticker that shows this EUI64.`;
+              this.motor = null;
+              w.step = 1;
+              this.render();
+            };
             button.disabled = false;
             return;
           }
@@ -837,7 +885,13 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       </div>
       <details>
         <summary class="muted">Setting up from scratch (a motor without limits, configStatus even)</summary>
-        <p class="muted">Range start makes the motor forget its range and accept new limits. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit. On a venetian the slats come next, the way TaHoma Pro's "blade tilting" does it: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full. (On a venetian the slats turn with the same motor, so the slat buttons feel like small moves up and down.)</p>
+        <p class="muted">Only for a motor that never had limits, or lost them to a factory reset. A motor without limits ignores every Zigbee command, and this is what TaHoma Pro does to give it limits:</p>
+        <ol class="muted">
+          <li><b>Range start</b>: the motor forgets its range and accepts new limits.</li>
+          <li>Hold ▼ to the bottom position, <b>Save as bottom limit</b>.</li>
+          <li>Hold ▲ to the top position, <b>Save as top limit</b>.</li>
+          <li>Venetian only, the slats ("blade tilting" in TaHoma Pro): <b>Range start</b>, <b>Slats down</b> until the slats are closed one way, <b>Slats up</b> until closed the other way, <b>Range full</b>. The slats turn with the same motor, so these feel like small moves up and down.</li>
+        </ol>
         <div class="row">
           <button data-act="range-start" class="secondary">Range start</button><button data-act="range-full" class="secondary">Range full</button>
         </div>
@@ -850,6 +904,16 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         </div>
       </details>
       <p id="note"></p>`;
+  }
+
+  // The browser's list only shows names, so a wrong pick is normal; remember the
+  // names already tried so the next pick is an informed one.
+  wrongMotor(w) {
+    const name = this.motor.foundName || "that one";
+    w.tried = w.tried || [];
+    if (!w.tried.includes(name)) w.tried.push(name);
+    const tried = w.tried.length > 1 ? ` Not it: ${w.tried.join(", ")}.` : "";
+    return `"${name}" is a different motor (EUI64 ${this.motor.foundEui}). Press the button again and pick another one.${tried}`;
   }
 
   // Hold-to-move: a move command when the button goes down, offered again while it
@@ -959,7 +1023,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       w.step === 0
         ? `<p>Calibrating <b>${escapeHtml(w.name || w.eui64)}</b> (EUI64 ${w.eui64}). Close the TaHoma Pro app on your phone, stand near the blind, type the Pin Code from its sticker and connect.</p>
            <label>Pin Code <input id="pin" maxlength="6" value="${escapeHtml(w.pin)}"></label>
-           <div class="row"><button id="connect">Connect over Bluetooth</button><button id="cancel" class="secondary">Back</button></div>
+           <div class="row"><button id="connect">Connect over Bluetooth</button><button id="showall" class="secondary" hidden>Show all Somfy motors</button><button id="cancel" class="secondary">Back</button></div>
            <p id="note"></p>`
         : this.calibrationControls() + `<div class="row"><button id="finish" class="secondary">Done</button></div>`;
     view.innerHTML = `<h1>Calibrate</h1><div class="card">${body}</div>
@@ -967,6 +1031,11 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     const cancel = view.querySelector("#cancel");
     if (cancel) cancel.onclick = () => this.goHome();
     if (w.step === 0) {
+      view.querySelector("#showall").onclick = () => {
+        w.showAll = true;
+        view.querySelector("#showall").hidden = true;
+        view.querySelector("#connect").click();
+      };
       view.querySelector("#connect").onclick = async () => {
         const pin = view.querySelector("#pin").value.trim().toUpperCase();
         if (!/^[0-9A-F]{6}$/.test(pin)) return alert("The Pin Code is the 6 characters printed on the sticker.");
@@ -975,14 +1044,23 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         button.disabled = true;
         try {
           this.motor = new Motor(w.eui64, pin, (t) => this.say(t));
-          await this.motor.choose();
+          try {
+            await this.motor.choose(!w.showAll);
+          } catch (err) {
+            if (err.name === "NotFoundError" && !w.showAll) {
+              note.textContent = "Nothing picked. If the list stayed empty, move closer to the blind and try again, or show all the Somfy motors nearby and pick by name.";
+              note.className = "";
+              view.querySelector("#showall").hidden = false;
+              button.disabled = false;
+              return;
+            }
+            throw err;
+          }
           note.textContent = "Connecting...";
           const result = await this.motor.ensure();
           if (result !== "mine") {
             note.textContent =
-              result === "other"
-                ? `That is a different motor (EUI64 ${this.motor.foundEui}). Press the button again and pick another one.`
-                : "The motor refused the PIN. Check the Pin Code on the sticker.";
+              result === "other" ? this.wrongMotor(w) : "The motor refused the PIN. Check the Pin Code on the sticker.";
             note.className = "bad";
             button.disabled = false;
             return;
