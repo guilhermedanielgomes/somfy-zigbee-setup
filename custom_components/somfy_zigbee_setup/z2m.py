@@ -135,6 +135,14 @@ class Zigbee2MQTT:
             vendor = str(definition.get("vendor") or "")
             if "somfy" not in manufacturer.lower() and "somfy" not in vendor.lower():
                 continue
+            # Somfy also makes remotes, plugs and sensors. Motors are mains powered,
+            # so they are routers; a known device is a motor when it exposes a cover,
+            # an unknown router is kept, it is probably a motor waiting for its converter.
+            if dev.get("type") != "Router":
+                continue
+            exposes = definition.get("exposes")
+            if exposes and not any(e.get("type") == "cover" for e in exposes if isinstance(e, dict)):
+                continue
             result.append(
                 {
                     "ieee": dev.get("ieee_address"),
@@ -158,6 +166,14 @@ class Zigbee2MQTT:
     async def async_permit_join(self, seconds: int = 254) -> None:
         await mqtt.async_publish(
             self.hass, f"{self.base}/bridge/request/permit_join", json.dumps({"time": seconds})
+        )
+
+    async def async_interview(self, ieee: str) -> None:
+        """Ask Zigbee2MQTT to interview the device again (its model may have changed)."""
+        await mqtt.async_publish(
+            self.hass,
+            f"{self.base}/bridge/request/device/interview",
+            json.dumps({"id": self.friendly_name(ieee)}),
         )
 
     async def async_rename(self, ieee: str, name: str) -> dict:

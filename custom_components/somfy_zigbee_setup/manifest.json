@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/guilhermedanielgomes/somfy-zigbee-setup/issues",
   "requirements": [],
   "single_config_entry": true,
-  "version": "0.1.8"
+  "version": "0.1.9"
 }

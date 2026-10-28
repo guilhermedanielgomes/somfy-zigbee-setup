@@ -15,6 +15,16 @@ DEVICES = [
      "supported": True, "definition": {"vendor": "Philips", "description": "Bulb", "source": "native"}},
     {"ieee_address": IEEE, "friendly_name": "Office blind", "type": "Router", "manufacturer": "SOMFY",
      "model_id": "Sonesse2 40 Zigbee Venetian", "supported": False, "definition": None},
+    {"ieee_address": "0x4cc206fffe0a2b3c", "friendly_name": "Remote", "type": "EndDevice", "manufacturer": "SOMFY",
+     "model_id": "Ysia 5 HP Zigbee", "supported": True,
+     "definition": {"vendor": "Somfy", "description": "Ysia 5 channel blinds remote", "source": "native",
+                    "exposes": [{"type": "enum", "name": "action"}, {"type": "numeric", "name": "battery"}]}},
+    {"ieee_address": "0x4cc206fffe0a4d5e", "friendly_name": "Old remote", "type": "EndDevice", "manufacturer": "SOMFY",
+     "model_id": "Ysia 5 Zigbee Europe", "supported": False, "definition": None},
+    {"ieee_address": "0x4cc206fffe0a3c4d", "friendly_name": "Hall blind", "type": "Router", "manufacturer": "SOMFY",
+     "model_id": "Sonesse2 40 Zigbee Roller", "supported": True,
+     "definition": {"vendor": "Somfy", "description": "Sonesse2 40 Zigbee roller shades", "source": "native",
+                    "exposes": [{"type": "cover", "features": []}, {"type": "numeric", "name": "linkquality"}]}},
 ]
 
 
@@ -60,10 +70,26 @@ async def test_setup_registers_panel_and_lists_somfy_devices(hass, mqtt_mock, ha
     reply = await client.receive_json()
     assert reply["success"]
     assert reply["result"]["base_topic"] == "zigbee2mqtt"
+    # the Hue lamp is not Somfy; the Ysia remotes are Somfy but not motors (end devices, known or not)
     assert reply["result"]["devices"] == [
         {"ieee": IEEE, "friendly_name": "Office blind", "model_id": "Sonesse2 40 Zigbee Venetian",
-         "supported": False, "description": None, "source": None}
+         "supported": False, "description": None, "source": None},
+        {"ieee": "0x4cc206fffe0a3c4d", "friendly_name": "Hall blind", "model_id": "Sonesse2 40 Zigbee Roller",
+         "supported": True, "description": "Sonesse2 40 Zigbee roller shades", "source": "native"},
     ]
+
+
+async def test_interview_publishes(hass, mqtt_mock, hass_ws_client):
+    await setup_integration(hass, mqtt_mock)
+    async_fire_mqtt_message(hass, "zigbee2mqtt/bridge/devices", json.dumps(DEVICES))
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+    await client.send_json({"id": 1, "type": f"{DOMAIN}/interview", "ieee": IEEE})
+    reply = await client.receive_json()
+    assert reply["success"]
+    topic, payload = mqtt_mock.async_publish.call_args[0][:2]
+    assert topic == "zigbee2mqtt/bridge/request/device/interview"
+    assert json.loads(payload) == {"id": "Office blind"}
 
 
 async def test_permit_join_publishes(hass, mqtt_mock, hass_ws_client):

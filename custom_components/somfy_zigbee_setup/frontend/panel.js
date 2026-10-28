@@ -695,6 +695,57 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     await this.loadDevices();
   }
 
+  // The motor has a type setting (Roller, Venetian...). A venetian motor can
+  // leave the factory set to Roller: then it has no tilt and Zigbee2MQTT sees a
+  // roller blind. The wizard asked what the blind is, so the page puts it right.
+  async checkType(w) {
+    let settings;
+    try {
+      settings = await this.motor.readMotorFile();
+    } catch (err) {
+      this.say("Could not read the motor's settings: " + err.message);
+      return;
+    }
+    const value = (key) => (Array.isArray(settings[key]) ? settings[key][0] : settings[key]);
+    const type = value("Application");
+    w.tiltRange = "TiltRange" in settings ? value("TiltRange") : undefined;
+    this.say(`motor type: ${type}${w.tiltRange !== undefined ? `, slat positions: ${w.tiltRange === null ? "not set" : "set"}` : ""}`);
+    if (!w.kind || type === w.kind || typeof type !== "string") return;
+    try {
+      const ok = await this.motor.setMotorType(w.kind);
+      w.typeWas = type;
+      w.typeChanged = true;
+      w.tiltRange = w.kind === "Venetian" ? null : undefined;
+      this.say(ok ? `motor type set to ${w.kind}, the motor confirmed` : `motor type ${w.kind} written, the motor did not confirm`);
+    } catch (err) {
+      this.say("Could not set the motor type: " + err.message);
+    }
+  }
+
+  // Zigbee2MQTT reads the model name during the interview; after a type change it must look again.
+  async interviewAgain(w) {
+    try {
+      const waiting = this.waitForJoin(w.eui64);
+      await this._hass.callWS({ type: "somfy_zigbee_setup/interview", ieee: this.ieeeOf(w.eui64) });
+      this.say("asked Zigbee2MQTT to interview the motor again...");
+      const ok = await Promise.race([waiting, new Promise((r) => setTimeout(() => r(null), 60000))]);
+      if (ok === null) this.say("Zigbee2MQTT did not finish the interview in a minute");
+      await new Promise((r) => setTimeout(r, 1000));
+      await this.loadDevices();
+    } catch (err) {
+      this.say("Could not ask for the interview: " + err.message);
+    }
+  }
+
+  modelWarning(w) {
+    const dev = this.deviceFor(w.eui64);
+    if (!dev || !w.kind || !dev.model_id) return "";
+    const seen = /venetian/i.test(dev.model_id) ? "Venetian" : /roller/i.test(dev.model_id) ? "Roller" : null;
+    if (!seen || seen === w.kind) return "";
+    return `<div class="warn"><b>Zigbee2MQTT still sees this motor as a ${seen.toLowerCase()}</b> (${escapeHtml(dev.model_id)}). The motor applies its new type after a power cycle: cut its power for ten seconds, then press Interview again.
+      <div class="row"><button id="again" class="secondary">Interview again</button></div></div>`;
+  }
+
   // A name typed in the wizard goes to Zigbee2MQTT once the motor is there. Not fatal if refused.
   async renameIfAsked(w) {
     const existing = this.deviceFor(w.eui64);
@@ -792,7 +843,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       <div class="card"><h2>Events</h2><div class="log">${escapeHtml(this.lines.join("\n"))}</div></div>`;
 
     view.querySelector("#add").onclick = () => {
-      this.wizard = { step: 1, eui64: "", pin: "", name: "" };
+      this.wizard = { step: 1, eui64: "", pin: "", name: "", kind: "Venetian" };
       this.view = "wizard";
       this.render();
     };
@@ -809,7 +860,8 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     view.querySelectorAll("[data-cal]").forEach((b) => {
       b.onclick = () => {
         const dev = this.devices.find((d) => d.ieee === b.dataset.cal);
-        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name };
+        const kind = dev && /venetian/i.test(dev.model_id || "") ? "Venetian" : dev && /roller/i.test(dev.model_id || "") ? "Roller" : null;
+        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name, kind };
         this.view = "calibrate";
         this.render();
       };
@@ -833,6 +885,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <label>EUI64 <input id="eui" placeholder="4CC206FFFE0A1B2C" value="${escapeHtml(w.eui64)}"></label>
         <label>Pin Code <input id="pin" placeholder="6 characters" maxlength="6" value="${escapeHtml(w.pin)}"></label>
         <label>Name in Home Assistant (optional) <input id="name" placeholder="Kitchen blind" maxlength="80" value="${escapeHtml(w.name || "")}"></label>
+        <label>Blind type <select id="kind"><option value="Venetian" ${w.kind !== "Roller" ? "selected" : ""}>Venetian (slats)</option><option value="Roller" ${w.kind === "Roller" ? "selected" : ""}>Roller</option></select></label>
         <p class="muted" id="qrnote">${escapeHtml(w.hint || "")}</p>
         <div class="row"><button id="next">Next</button><button id="cancel" class="secondary">Cancel</button></div>`;
     } else if (w.step === 2) {
@@ -844,14 +897,17 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
           <div class="row"><button id="yes">Yes</button><button id="no" class="secondary">No</button></div></div>`;
     } else if (w.step === 3) {
       const existing = this.deviceFor(w.eui64);
-      body = existing
+      const changed = w.typeChanged
+        ? `<div class="warn"><b>The motor was set up as a ${w.typeWas === "Roller" ? "roller" : w.typeWas} and is now a ${w.kind.toLowerCase()}.</b> The motor applies this after a power cycle: if you can, cut its power for ten seconds now, then continue. Zigbee2MQTT will interview it again so that it shows up as a ${w.kind.toLowerCase()}.</div>`
+        : "";
+      body = changed + (existing
         ? `<p>This motor is already in Zigbee2MQTT as <b>${escapeHtml(existing.friendly_name)}</b>.</p>
            <div class="row"><button id="skip">Continue</button><button id="pair" class="secondary">Make it leave and join again</button></div>`
         : `<p>Permit join goes on in Zigbee2MQTT, the motor is told to leave its current network, and the page waits for Zigbee2MQTT to report the join (up to 3 minutes).</p>
-           <div class="row"><button id="pair">Pair with Zigbee2MQTT</button><button id="cancel" class="secondary">Cancel</button></div>`;
+           <div class="row"><button id="pair">Pair with Zigbee2MQTT</button><button id="cancel" class="secondary">Cancel</button></div>`);
       body += `<p id="note"></p>`;
     } else if (w.step === 4) {
-      body = `<p id="note">Reading configStatus from the motor...</p>
+      body = `${this.modelWarning(w)}<p id="note">Reading configStatus from the motor...</p>
         <div class="row" id="actions" hidden>
           <button id="calibrate">Calibrate now</button><button id="finish" class="secondary">Finish</button></div>`;
     } else if (w.step === 5) {
@@ -902,6 +958,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         w.eui64 = eui64;
         w.pin = pin;
         w.name = view.querySelector("#name").value.trim();
+        w.kind = view.querySelector("#kind").value;
         w.hint = "";
         w.step = 2;
         this.render();
@@ -968,7 +1025,10 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
           button.disabled = false;
         }
       };
-      view.querySelector("#yes").onclick = () => {
+      view.querySelector("#yes").onclick = async () => {
+        view.querySelector("#yes").disabled = true;
+        note("Checking the motor's settings...");
+        await this.checkType(w);
         w.step = 3;
         this.render();
       };
@@ -985,7 +1045,12 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       const skip = view.querySelector("#skip");
       if (skip)
         skip.onclick = async () => {
+          skip.disabled = true;
           await this.renameIfAsked(w);
+          if (w.typeChanged) {
+            note("Zigbee2MQTT is interviewing the motor again...");
+            await this.interviewAgain(w);
+          }
           w.step = 4;
           this.render();
           this.runStatus();
@@ -1018,6 +1083,14 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     }
 
     if (w.step === 4) {
+      const again = view.querySelector("#again");
+      if (again)
+        again.onclick = async () => {
+          again.disabled = true;
+          await this.interviewAgain(w);
+          this.render();
+          this.runStatus();
+        };
       view.querySelector("#calibrate").onclick = () => {
         w.step = 5;
         this.render();
@@ -1054,7 +1127,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
   calibrationControls() {
     const w = this.wizard;
     const hint = w.noLimits
-      ? `<div class="warn"><b>This motor has no limits yet.</b> Hold ▲ for a second: if the blind goes down, press Swap direction. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit, and press Check status. If Zigbee2MQTT shows this venetian without tilt, open the section at the bottom first.</div>`
+      ? `<div class="warn"><b>This motor has no limits yet.</b> Hold ▲ for a second: if the blind goes down, press Swap direction. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit, and press Check status.</div>`
       : "";
     return `
       ${hint}
@@ -1076,26 +1149,28 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <button data-act="swap" class="secondary">Swap direction</button>
         <button data-act="stop" class="secondary">Stop</button><button data-act="status" class="secondary">Check status</button>
       </div>
-      <details ${w.slats ? "open" : ""}>
-        <summary class="muted">Venetian that shows no tilt in Zigbee2MQTT (a motor TaHoma Pro never installed)</summary>
-        <p class="muted">Such a motor still believes it drives a roller blind. One press makes it a venetian like the others; the motor then needs a power cycle, a new interview in Zigbee2MQTT and its limits set again.</p>
-        <div class="row">
-          <button data-act="venetian" class="secondary">Make it a venetian like the others</button>
-          <span id="mtype" class="muted">${escapeHtml(w.motorType ? `Motor type: ${w.motorType}` : "")}</span>
-        </div>
-        <p class="muted">Then the slats need their two closed positions once, so that tilt 50% is the middle. This is what TaHoma Pro did in "blade tilting".</p>
-        ${
-          !w.slats
-            ? `<div class="row"><button data-act="slats-start" class="secondary">Align the slats</button></div>`
-            : `<p>${w.slats === "one" ? "Turn the slats until they are fully closed one way" : "Now turn them until they are fully closed the other way"} (small moves; the slats turn during the first part of a move), then press the button.</p>
-               <div class="row">
-                 <button data-act="tilt-up" class="secondary">▲ a bit</button><button data-act="tilt-down" class="secondary">▼ a bit</button>
-                 <button data-act="${w.slats === "one" ? "slats-one" : "slats-other"}">${w.slats === "one" ? "Closed one way" : "Closed the other way"}</button>
-                 <button data-act="slats-cancel" class="secondary">Cancel</button>
-               </div>`
-        }
-      </details>
+      ${this.slatsBox(w)}
       <p id="note"></p>`;
+  }
+
+  // The slats of a venetian need their two closed positions once, so that tilt
+  // 0% and 100% are the closed positions and 50% the middle. The motor says
+  // whether it has them; a motor that was just made a venetian has not.
+  slatsBox(w) {
+    if (w.kind !== "Venetian") return "";
+    const needed = w.tiltRange === null;
+    const prompt = !w.slats
+      ? `<div class="row"><button data-act="slats-start" class="${needed ? "" : "secondary"}">Align the slats</button></div>`
+      : `<p>${w.slats === "one" ? "Turn the slats until they are fully closed one way" : "Now turn them until they are fully closed the other way"} (small moves; the slats turn during the first part of a move), then press the button.</p>
+         <div class="row">
+           <button data-act="tilt-up" class="secondary">▲ a bit</button><button data-act="tilt-down" class="secondary">▼ a bit</button>
+           <button data-act="${w.slats === "one" ? "slats-one" : "slats-other"}">${w.slats === "one" ? "Closed one way" : "Closed the other way"}</button>
+           <button data-act="slats-cancel" class="secondary">Cancel</button>
+         </div>`;
+    if (needed || w.slats) {
+      return `<div class="warn" style="margin-top:12px"><b>The slats have no positions yet.</b> Once the limits are saved, the slats need their two closed positions, so that tilt 50% is the middle.${prompt}</div>`;
+    }
+    return `<details><summary class="muted">Slats</summary><p class="muted">The slat positions are set. Align them again only if tilt 0% and 100% do not match the closed positions.</p>${prompt}</details>`;
   }
 
   // The browser's list only shows names, so a wrong pick is normal; remember the
@@ -1204,27 +1279,12 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
             await m.rangeFull();
             this.say("slats aligned: tilt 0% and 100% are the two closed positions, 50% is the middle");
             this.wizard.slats = null;
+            this.wizard.tiltRange = "set";
             this.render();
             return;
           } else if (act === "slats-cancel") {
             this.wizard.slats = null;
             this.render();
-            return;
-          } else if (act === "venetian") {
-            const type = await m.motorType();
-            this.wizard.motorType = type;
-            view.querySelector("#mtype").textContent = `Motor type: ${type}`;
-            this.say(`motor type: ${type}`);
-            if (type === "Venetian") {
-              note("The motor already is a venetian. If Zigbee2MQTT still shows it as a roller, press Interview on its Zigbee2MQTT page.");
-              return;
-            }
-            if (!confirm(`The motor says "${type}". Make it a venetian? It forgets its limits (set them again afterwards) and Zigbee2MQTT must interview it again.`)) return;
-            const ok = await m.setMotorType("Venetian");
-            this.wizard.motorType = "Venetian (written)";
-            view.querySelector("#mtype").textContent = "Motor type: Venetian (written)";
-            this.say(ok ? "motor type set to venetian, the motor confirmed" : "motor type written, the motor did not confirm (it may still have taken it)");
-            note("Now: cut the motor's power for 10 seconds if you can, press Interview on its Zigbee2MQTT page (the model should read Venetian), then set the direction and limits again, and align the slats.");
             return;
           }
           note("");
@@ -1286,6 +1346,10 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
           }
           this.say(`Connected to ${w.eui64}, PIN accepted`);
           w.pin = pin;
+          if (w.kind === "Venetian") {
+            note.textContent = "Checking the motor's settings...";
+            await this.checkType(w);
+          }
           w.step = 1;
           this.render();
         } catch (err) {
