@@ -394,15 +394,35 @@ class Motor:
         await asyncio.sleep(FILE_PAUSE)
         await self.write(FILE_CMD, b"\x03" + MOTOR_FILE)
         await asyncio.sleep(FILE_PAUSE)
-        data = await self.read(FILE_CMD)
+        # the file can be longer than one Bluetooth read: keep reading until the
+        # CBOR is complete, or until the motor repeats itself or sends nothing
+        data, settings, problem, last = b"", None, None, None
+        for _ in range(12):
+            try:
+                chunk = await self.read(FILE_CMD)
+            except Exception:
+                if data:
+                    break
+                raise
+            if not chunk or chunk == last:
+                break
+            last = chunk
+            data += chunk
+            try:
+                settings = cbor_decode(data)
+                break
+            except Exception as err:
+                problem = err
+                await asyncio.sleep(0.15)
         await asyncio.sleep(FILE_PAUSE)
         try:
             await self.write(FILE_CMD, b"\x04" + MOTOR_FILE)
         except Exception:
             pass
-        if not data:
-            raise RuntimeError("the motor sent an empty settings file")
-        return cbor_decode(data)
+        if settings is None:
+            raise RuntimeError("could not read the motor's settings file (%d bytes: %s%s, %s)"
+                               % (len(data), data[:48].hex(), "..." if len(data) > 48 else "", problem or "nothing came"))
+        return settings
 
     async def write_motor_setting(self, key, value):
         """Open for writing, send {key: [value]}, close, then ask the motor whether it took it."""

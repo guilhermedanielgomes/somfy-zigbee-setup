@@ -408,15 +408,42 @@ export class Motor {
       await pause(FILE_PAUSE);
       await this._write("file", Uint8Array.from([0x03, ...MOTOR_FILE]));
       await pause(FILE_PAUSE);
-      const bytes = await this._read("file");
+      // the file can be longer than one Bluetooth read: keep reading until the
+      // CBOR is complete, or until the motor repeats itself or sends nothing
+      let bytes = new Uint8Array(0);
+      let settings = null;
+      let problem = null;
+      let last = "";
+      for (let i = 0; i < 12 && settings === null; i++) {
+        let chunk;
+        try {
+          chunk = await this._read("file");
+        } catch (err) {
+          if (bytes.length) break;
+          throw err;
+        }
+        const asHex = hex(chunk);
+        if (!chunk.length || asHex === last) break;
+        last = asHex;
+        bytes = Uint8Array.from([...bytes, ...chunk]);
+        try {
+          settings = decodeCbor(bytes);
+        } catch (err) {
+          problem = err.message;
+          await pause(150);
+        }
+      }
       await pause(FILE_PAUSE);
       try {
         await this._write("file", Uint8Array.from([0x04, ...MOTOR_FILE]));
       } catch (err) {
         // already closed by the motor, fine
       }
-      if (!bytes.length) throw new Error("the motor sent an empty settings file");
-      return decodeCbor(bytes);
+      if (settings === null) {
+        this.log(`settings file: ${bytes.length} bytes received, ${problem || "nothing"}: ${hex(bytes.slice(0, 48))}${bytes.length > 48 ? "..." : ""}`);
+        throw new Error("could not read the motor's settings file (details in the log)");
+      }
+      return settings;
     });
   }
 
@@ -1027,7 +1054,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
   calibrationControls() {
     const w = this.wizard;
     const hint = w.noLimits
-      ? `<div class="warn"><b>This motor has no limits yet.</b> Hold ▲ for a second: if the blind goes down, press Swap direction. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit, and press Check status. A venetian that shows no tilt in Zigbee2MQTT needs its motor type set to venetian first (Advanced, below).</div>`
+      ? `<div class="warn"><b>This motor has no limits yet.</b> Hold ▲ for a second: if the blind goes down, press Swap direction. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit, and press Check status. If Zigbee2MQTT shows this venetian without tilt, open the section at the bottom first.</div>`
       : "";
     return `
       ${hint}
@@ -1049,21 +1076,24 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <button data-act="swap" class="secondary">Swap direction</button>
         <button data-act="stop" class="secondary">Stop</button><button data-act="status" class="secondary">Check status</button>
       </div>
-      <details ${w.noLimits ? "open" : ""}>
-        <summary class="muted">Advanced: motor type and slats</summary>
-        <p class="muted">The motor has a type setting. A venetian motor still set to "Roller" has no tilt at all and shows up in Zigbee2MQTT as a roller blind; TaHoma Pro sets the type during installation, so blinds it installed are fine.</p>
+      <details ${w.slats ? "open" : ""}>
+        <summary class="muted">Venetian that shows no tilt in Zigbee2MQTT (a motor TaHoma Pro never installed)</summary>
+        <p class="muted">Such a motor still believes it drives a roller blind. One press makes it a venetian like the others; the motor then needs a power cycle, a new interview in Zigbee2MQTT and its limits set again.</p>
         <div class="row">
-          <button data-act="type-read" class="secondary">Read motor type</button>
-          <button data-act="type-venetian" class="secondary">Set to venetian</button>
+          <button data-act="venetian" class="secondary">Make it a venetian like the others</button>
           <span id="mtype" class="muted">${escapeHtml(w.motorType ? `Motor type: ${w.motorType}` : "")}</span>
         </div>
-        <p class="muted">Slats range, what 0%, 50% and 100% tilt mean (TaHoma Pro calls it blade tilting). Needed once on a venetian whose type was just set, never on a blind TaHoma Pro installed: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full. The slats turn with the same motor, so these feel like small moves up and down.</p>
-        <div class="row">
-          <button data-act="range-start" class="secondary">Range start</button>
-          <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
-          <button data-act="tilt-down" class="secondary">Slats down</button><button data-act="tilt-up" class="secondary">Slats up</button>
-          <button data-act="range-full" class="secondary">Range full</button>
-        </div>
+        <p class="muted">Then the slats need their two closed positions once, so that tilt 50% is the middle. This is what TaHoma Pro did in "blade tilting".</p>
+        ${
+          !w.slats
+            ? `<div class="row"><button data-act="slats-start" class="secondary">Align the slats</button></div>`
+            : `<p>${w.slats === "one" ? "Turn the slats until they are fully closed one way" : "Now turn them until they are fully closed the other way"} (small moves; the slats turn during the first part of a move), then press the button.</p>
+               <div class="row">
+                 <button data-act="tilt-up" class="secondary">▲ a bit</button><button data-act="tilt-down" class="secondary">▼ a bit</button>
+                 <button data-act="${w.slats === "one" ? "slats-one" : "slats-other"}">${w.slats === "one" ? "Closed one way" : "Closed the other way"}</button>
+                 <button data-act="slats-cancel" class="secondary">Cancel</button>
+               </div>`
+        }
       </details>
       <p id="note"></p>`;
   }
@@ -1136,8 +1166,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       b.onclick = async () => {
         const act = b.dataset.act;
         const steps = parseInt(view.querySelector("#step").value, 10);
-        const tstepEl = view.querySelector("#tstep");
-        const tsteps = tstepEl ? parseInt(tstepEl.value, 10) : 50;
+        const tsteps = 10;
         try {
           if (act === "status") return void (await this.configStatus(eui64));
           const m = this.motor;
@@ -1147,7 +1176,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
             this.say(`moving ${direction} (${steps} steps)`);
           } else if (act === "tilt-up" || act === "tilt-down") {
             await m.tilt(act.slice(5), tsteps);
-            this.say(`tilting ${act.slice(5)} (${tsteps})`);
+            this.say(`slats ${act.slice(5)} (${tsteps})`);
           } else if (act === "stop") {
             await m.stop();
             this.say("stop sent");
@@ -1159,26 +1188,43 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
           } else if (act === "swap") {
             const next = await m.swapDirection();
             this.say(`direction set to ${next ? "clockwise" : "counter-clockwise"} - hold ▲ to check, swap again if it still goes down`);
-          } else if (act === "range-start") {
-            if (!confirm("Start the slats range: the motor forgets its slat range until you press Range full. Continue?")) return;
+          } else if (act === "slats-start") {
+            if (!confirm("Start aligning the slats? The motor forgets their old positions until you finish.")) return;
             await m.rangeStart();
-            this.say("slats range started: Slats down to one end, Slats up to the other, then Range full");
-          } else if (act === "range-full") {
-            if (!confirm("Finish the slats range with the current end positions?")) return;
+            this.say("slat alignment started");
+            this.wizard.slats = "one";
+            this.render();
+            return;
+          } else if (act === "slats-one") {
+            this.say("first closed position taken");
+            this.wizard.slats = "other";
+            this.render();
+            return;
+          } else if (act === "slats-other") {
             await m.rangeFull();
-            this.say("slats range saved");
-          } else if (act === "type-read") {
+            this.say("slats aligned: tilt 0% and 100% are the two closed positions, 50% is the middle");
+            this.wizard.slats = null;
+            this.render();
+            return;
+          } else if (act === "slats-cancel") {
+            this.wizard.slats = null;
+            this.render();
+            return;
+          } else if (act === "venetian") {
             const type = await m.motorType();
             this.wizard.motorType = type;
             view.querySelector("#mtype").textContent = `Motor type: ${type}`;
             this.say(`motor type: ${type}`);
-          } else if (act === "type-venetian") {
-            if (!confirm("Set the motor type to venetian? The motor forgets its limits and needs them set again, and Zigbee2MQTT must interview it again. Continue?")) return;
+            if (type === "Venetian") {
+              note("The motor already is a venetian. If Zigbee2MQTT still shows it as a roller, press Interview on its Zigbee2MQTT page.");
+              return;
+            }
+            if (!confirm(`The motor says "${type}". Make it a venetian? It forgets its limits (set them again afterwards) and Zigbee2MQTT must interview it again.`)) return;
             const ok = await m.setMotorType("Venetian");
             this.wizard.motorType = "Venetian (written)";
             view.querySelector("#mtype").textContent = "Motor type: Venetian (written)";
             this.say(ok ? "motor type set to venetian, the motor confirmed" : "motor type written, the motor did not confirm (it may still have taken it)");
-            note("Now: cut the motor's power for 10 seconds if you can, press Interview on its Zigbee2MQTT page (the model should read Venetian), then set the limits again and the slats range.");
+            note("Now: cut the motor's power for 10 seconds if you can, press Interview on its Zigbee2MQTT page (the model should read Venetian), then set the direction and limits again, and align the slats.");
             return;
           }
           note("");
