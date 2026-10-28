@@ -1,7 +1,7 @@
 """Constants for Somfy Zigbee Setup."""
 
 DOMAIN = "somfy_zigbee_setup"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 CONF_BASE_TOPIC = "base_topic"
 DEFAULT_BASE_TOPIC = "zigbee2mqtt"

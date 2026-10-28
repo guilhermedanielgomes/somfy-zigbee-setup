@@ -22,6 +22,7 @@ const CHAR = {
   stop: [SERVICE.operational, somfyUuid(0x00000006)],
   auth: [SERVICE.operational, somfyUuid(0x0000000b)],
   firmware: [SERVICE.configuration, somfyUuid(0x00010002)],
+  direction: [SERVICE.configuration, somfyUuid(0x00010005)],
   limit: [SERVICE.configuration, somfyUuid(0x00010007)],
   down: [SERVICE.configuration, somfyUuid(0x00010008)],
   up: [SERVICE.configuration, somfyUuid(0x00010009)],
@@ -293,6 +294,23 @@ export class Motor {
     await this.write(direction === "up" ? "up" : "down", payload);
   }
 
+  // Up and down the other way round: 0 = counter-clockwise, 1 = clockwise. The
+  // current setting is read when the motor lets us; if not, the first swap tries
+  // clockwise and the next one the other way.
+  async swapDirection() {
+    let current = null;
+    try {
+      const value = await this.read("direction");
+      if (value.length) current = value[0] ? 1 : 0;
+    } catch (err) {
+      current = this.lastDirection === undefined ? null : this.lastDirection;
+    }
+    const next = current === 1 ? 0 : 1;
+    await this.write("direction", Uint8Array.from([next]));
+    this.lastDirection = next;
+    return next;
+  }
+
   async saveLimit(which) {
     await this.write("limit", Uint8Array.from([which === "top" ? 0 : 1]));
   }
@@ -359,9 +377,8 @@ const STYLE = `
   button:disabled { opacity: .5; cursor: default; }
   button.hold { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; padding: 14px 18px; }
   button.hold.on { filter: brightness(1.3); box-shadow: 0 0 0 3px var(--primary-color); }
-  details { margin-top: 12px; }
-  summary { cursor: pointer; }
-  ol { padding-left: 20px; } ol li { margin: 4px 0; }
+  .scratch { border: 1px solid var(--divider-color, #ccc); border-radius: 8px; padding: 12px; margin-top: 12px; }
+  .scratch h2 { margin-bottom: 8px; }
   input, select { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ccc);
                   background: var(--card-background-color, #fff); color: var(--primary-text-color); width: 100%; box-sizing: border-box; }
   label { display: block; margin: 10px 0 4px; font-size: 14px; }
@@ -606,7 +623,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       <div class="card"><h2>Events</h2><div class="log">${escapeHtml(this.lines.join("\n"))}</div></div>`;
 
     view.querySelector("#add").onclick = () => {
-      this.wizard = { step: 1, eui64: "", pin: "", name: "" };
+      this.wizard = { step: 1, eui64: "", pin: "", name: "", scratch: null };
       this.view = "wizard";
       this.render();
     };
@@ -623,7 +640,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     view.querySelectorAll("[data-cal]").forEach((b) => {
       b.onclick = () => {
         const dev = this.devices.find((d) => d.ieee === b.dataset.cal);
-        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name };
+        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name, scratch: null };
         this.view = "calibrate";
         this.render();
       };
@@ -834,6 +851,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     if (w.step === 4) {
       view.querySelector("#calibrate").onclick = () => {
         w.step = 5;
+        if (w.noLimits) w.scratch = { step: 1, swaps: 0, text: "", done: false };
         this.render();
       };
       view.querySelector("#finish").onclick = () => this.goHome();
@@ -858,9 +876,10 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     const note = view.querySelector("#note");
     const actions = view.querySelector("#actions");
     if (!note) return;
+    w.noLimits = value !== null && value % 2 === 0;
     if (value === null) note.textContent = "No answer. You can still try the calibration, or check the Zigbee2MQTT log.";
     else if (value % 2) note.textContent = `configStatus ${value}: the motor is calibrated. Fine-tune a limit now, or finish.`;
-    else note.textContent = `configStatus ${value}: the motor has no limits and will not move until it is calibrated.`;
+    else note.textContent = `configStatus ${value}: the motor has no limits and will not move until it is calibrated. "Calibrate now" walks you through it.`;
     actions.hidden = false;
   }
 
@@ -882,28 +901,108 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       </div>
       <div class="row">
         <button data-act="stop" class="secondary">Stop</button><button data-act="status" class="secondary">Check status</button>
+        <button id="scratch" class="secondary" ${this.wizard.scratch ? "hidden" : ""}>Set up from scratch</button>
       </div>
-      <details>
-        <summary class="muted">Setting up from scratch (a motor without limits, configStatus even)</summary>
-        <p class="muted">Only for a motor that never had limits, or lost them to a factory reset. A motor without limits ignores every Zigbee command, and this is what TaHoma Pro does to give it limits:</p>
-        <ol class="muted">
-          <li><b>Range start</b>: the motor forgets its range and accepts new limits.</li>
-          <li>Hold ▼ to the bottom position, <b>Save as bottom limit</b>.</li>
-          <li>Hold ▲ to the top position, <b>Save as top limit</b>.</li>
-          <li>Venetian only, the slats ("blade tilting" in TaHoma Pro): <b>Range start</b>, <b>Slats down</b> until the slats are closed one way, <b>Slats up</b> until closed the other way, <b>Range full</b>. The slats turn with the same motor, so these feel like small moves up and down.</li>
-        </ol>
-        <div class="row">
-          <button data-act="range-start" class="secondary">Range start</button><button data-act="range-full" class="secondary">Range full</button>
-        </div>
-        <div class="row">
-          <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
-          <button data-act="tilt-up" class="secondary">Slats up</button><button data-act="tilt-down" class="secondary">Slats down</button>
-        </div>
-        <div class="row">
-          <button data-act="identify" class="secondary">Identify</button><button data-act="info" class="secondary">Info</button>
-        </div>
-      </details>
+      ${this.scratchPanel()}
       <p id="note"></p>`;
+  }
+
+  // A motor without limits (configStatus even) ignores every Zigbee command. This
+  // is the sequence TaHoma Pro walks through to give it limits, one step at a time.
+  scratchPanel() {
+    const sc = this.wizard.scratch;
+    if (!sc) return "";
+    const names = ["Direction", "Range", "Bottom", "Top", "Check", "Slats"];
+    const bar = `<div class="steps">${names.map((n, i) => `<span class="step ${i + 1 === sc.step ? "on" : ""}">${i + 1}. ${n}</span>`).join("")}</div>`;
+    let body = "";
+    if (sc.step === 1) {
+      body = `<p>Hold <b>▲ Hold to move up</b> for a second. Did the blind go <b>up</b>?${sc.swaps ? " (direction swapped, try again)" : ""}</p>
+        <div class="row"><button data-scratch="up-ok">Yes, it went up</button><button data-scratch="swap" class="secondary">No, swap the direction</button></div>`;
+    } else if (sc.step === 2) {
+      body = `<p>The motor now forgets its old range and accepts new limits. Nothing moves.</p>
+        <div class="row"><button data-scratch="range-start">Range start</button></div>`;
+    } else if (sc.step === 3) {
+      body = `<p>Hold <b>▼</b> until the blind is where it should stop at the bottom (▼ a little for the last bit), then save it.</p>
+        <div class="row"><button data-scratch="limit-bottom">Save as bottom limit</button></div>`;
+    } else if (sc.step === 4) {
+      body = `<p>Hold <b>▲</b> until the blind is where it should stop at the top, then save it.</p>
+        <div class="row"><button data-scratch="limit-top">Save as top limit</button></div>`;
+    } else if (sc.step === 5) {
+      body = `<p id="scratchnote">${escapeHtml(sc.text || "Asking the motor whether it has its limits now...")}</p>
+        <div class="row" id="scratchactions" ${sc.text ? "" : "hidden"}>
+          ${sc.done ? `<button data-scratch="finish">Done</button>` : `<button data-scratch="slats">Set up the slats</button><button data-scratch="check" class="secondary">Check again</button>`}
+        </div>`;
+    } else if (sc.step === 6) {
+      body = `<p>The slats, the way TaHoma Pro's "blade tilting" does it: <b>Range start</b>, then <b>Slats down</b> until the slats are fully closed one way, <b>Slats up</b> until fully closed the other way, then <b>Range full</b>. The slats turn with the same motor, so these feel like small moves up and down.</p>
+        <div class="row"><button data-scratch="range-start" class="secondary">Range start</button>
+          <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
+          <button data-act="tilt-down" class="secondary">Slats down</button><button data-act="tilt-up" class="secondary">Slats up</button>
+          <button data-scratch="range-full" class="secondary">Range full</button></div>
+        <div class="row"><button data-scratch="check">Check status</button></div>`;
+    }
+    return `<div class="scratch"><h2>Setting up from scratch</h2>${bar}${body}</div>`;
+  }
+
+  async scratchAction(view, act) {
+    const w = this.wizard;
+    const sc = w.scratch;
+    const m = this.motor;
+    try {
+      if (act === "swap") {
+        const next = await m.swapDirection();
+        sc.swaps += 1;
+        this.say(`direction set to ${next ? "clockwise" : "counter-clockwise"}`);
+      } else if (act === "up-ok") {
+        sc.step = 2;
+      } else if (act === "range-start") {
+        await m.rangeStart();
+        this.say("range setup started");
+        if (sc.step === 2) sc.step = 3;
+      } else if (act === "limit-bottom") {
+        await m.saveLimit("bottom");
+        this.say("bottom limit saved");
+        sc.step = 4;
+      } else if (act === "limit-top") {
+        await m.saveLimit("top");
+        this.say("top limit saved");
+        sc.step = 5;
+        sc.text = "";
+        this.render();
+        return this.scratchCheck();
+      } else if (act === "range-full") {
+        await m.rangeFull();
+        this.say("range setup finished");
+      } else if (act === "check") {
+        sc.step = 5;
+        sc.text = "";
+        this.render();
+        return this.scratchCheck();
+      } else if (act === "slats") {
+        sc.step = 6;
+      } else if (act === "finish") {
+        w.scratch = null;
+      }
+      this.render();
+    } catch (err) {
+      this.say("error: " + err.message);
+      const note = view.querySelector("#note");
+      if (note) {
+        note.textContent = err.message;
+        note.className = "bad";
+      }
+    }
+  }
+
+  async scratchCheck() {
+    const sc = this.wizard.scratch;
+    const value = await this.configStatus(this.wizard.eui64).catch(() => null);
+    if (!sc || sc.step !== 5) return;
+    if (value === null) sc.text = "No answer from Zigbee2MQTT. Check again in a moment.";
+    else if (value % 2) {
+      sc.text = `configStatus ${value}: the motor has its limits now and will move. You can fine-tune them above.`;
+      sc.done = true;
+    } else sc.text = `configStatus ${value}: still no limits. On a venetian the slats need their range too.`;
+    this.render();
   }
 
   // The browser's list only shows names, so a wrong pick is normal; remember the
@@ -970,11 +1069,21 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(type, this._release);
       b.addEventListener("contextmenu", (ev) => ev.preventDefault());
     });
+    const scratch = view.querySelector("#scratch");
+    if (scratch)
+      scratch.onclick = () => {
+        this.wizard.scratch = { step: 1, swaps: 0, text: "", done: false };
+        this.render();
+      };
+    view.querySelectorAll("[data-scratch]").forEach((b) => {
+      b.onclick = () => this.scratchAction(view, b.dataset.scratch);
+    });
     view.querySelectorAll("[data-act]").forEach((b) => {
       b.onclick = async () => {
         const act = b.dataset.act;
         const steps = parseInt(view.querySelector("#step").value, 10);
-        const tsteps = parseInt(view.querySelector("#tstep").value, 10);
+        const tstepEl = view.querySelector("#tstep");
+        const tsteps = tstepEl ? parseInt(tstepEl.value, 10) : 50;
         try {
           if (act === "status") return void (await this.configStatus(eui64));
           const m = this.motor;
@@ -988,25 +1097,11 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
           } else if (act === "stop") {
             await m.stop();
             this.say("stop sent");
-          } else if (act === "identify") {
-            await m.identify();
-            this.say("identify sent, the motor should jog");
           } else if (act === "limit-top" || act === "limit-bottom") {
             const which = act === "limit-top" ? "top" : "bottom";
             if (!confirm(`Save the current position as the ${which} limit?`)) return;
             await m.saveLimit(which);
             this.say(`${which} limit saved`);
-          } else if (act === "range-start") {
-            if (!confirm("The motor forgets its range until you finish the setup. Start?")) return;
-            await m.rangeStart();
-            this.say("range setup started");
-          } else if (act === "range-full") {
-            if (!confirm("Finish the range setup?")) return;
-            await m.rangeFull();
-            this.say("range setup finished");
-          } else if (act === "info") {
-            const info = await m.info();
-            this.say(`Zigbee channel ${info.channel}, PAN ID ${info.pan}, firmware ${info.firmware}`);
           }
           note("");
         } catch (err) {

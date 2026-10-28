@@ -38,6 +38,7 @@ IDENTIFY = uuid(0x00000001)
 STOP = uuid(0x00000006)
 AUTH = uuid(0x0000000B)
 FIRMWARE = uuid(0x00010002)
+DIRECTION = uuid(0x00010005)
 LIMIT = uuid(0x00010007)
 MOVE_DOWN = uuid(0x00010008)
 MOVE_UP = uuid(0x00010009)
@@ -59,6 +60,7 @@ CALIBRATE_HELP = """
   limit down                   save the current position as the bottom limit
   range start                  start a new range setup (the motor forgets its range)
   range full                   finish the range setup
+  direction cw / direction ccw set the turning direction (swap if up moves down)
   guide                        the order to do things in
   quit
 """
@@ -68,13 +70,15 @@ CALIBRATE_GUIDE = """
     move the blind with up/down, then 'limit up' or 'limit down'.
 
   Setting a motor up from scratch (configStatus even, blind does not move):
-    1. range start
-    2. down 100 until the blind is where the bottom should be
+    1. up 100 - did the blind go up? If it went down: direction cw
+       (or direction ccw if that did not change it), then up 100 again
+    2. range start
+    3. down 100 until the blind is where the bottom should be
        (use down 20 or down 5 near the end), then: limit down
-    3. up 100 until it is where the top should be, then: limit up
-    4. optional, for the slats: range start, tilt-down 50 until the slats
-       stop turning, tilt-up 50 until they stop the other way, range full
-    5. status - the number should now be odd
+    4. up 100 until it is where the top should be, then: limit up
+    5. status - odd means done. If still even on a venetian, the slats:
+       range start, tilt-down 50 until the slats stop turning,
+       tilt-up 50 until they stop the other way, range full, status
 
   If the motor disappears from Zigbee2MQTT after step 4, turn on permit join
   and run 'somfy_setup.py pair' again. The limits stay in the motor.
@@ -684,6 +688,9 @@ async def calibrate_command(motor, z2m, line):
             print("  range setup finished")
         else:
             print("  cancelled")
+    elif cmd == "direction" and args[:1] in (["cw"], ["ccw"]):
+        await motor.write(DIRECTION, b"\x01" if args[0] == "cw" else b"\x00")
+        print(f"  direction set to {'clockwise' if args[0] == 'cw' else 'counter-clockwise'}")
     else:
         print("  unknown command - type help")
     return True
