@@ -14,6 +14,7 @@ const SERVICE = {
   operational: somfyUuid(0x00000000),
   configuration: somfyUuid(0x00010000),
   network: somfyUuid(0x00020000),
+  files: somfyUuid(0x00040000),
 };
 
 // name: [service, characteristic]
@@ -31,7 +32,94 @@ const CHAR = {
   channel: [SERVICE.network, somfyUuid(0x00020002)],
   pan: [SERVICE.network, somfyUuid(0x00020003)],
   eui: [SERVICE.network, somfyUuid(0x00020005)],
+  // the motor's settings files: commands on one characteristic, result on another
+  file: [SERVICE.files, somfyUuid(0x00040001)],
+  filestatus: [SERVICE.files, somfyUuid(0x00040003)],
 };
+
+// The "motor" settings file (0x00C4, sent low byte first): Application type, ranges...
+const MOTOR_FILE = [0xc4, 0x00];
+// the motor wants a pause between file commands
+const FILE_PAUSE = 500;
+
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ------------------------------------------------------------------ CBOR, the subset the settings files use
+
+function decodeCbor(bytes) {
+  let pos = 0;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const length = (info) => {
+    if (info < 24) return info;
+    if (info === 24) return bytes[pos++];
+    if (info === 25) { const v = view.getUint16(pos); pos += 2; return v; }
+    if (info === 26) { const v = view.getUint32(pos); pos += 4; return v; }
+    if (info === 31) return -1; // indefinite
+    throw new Error("unsupported CBOR length");
+  };
+  const item = () => {
+    if (pos >= bytes.length) throw new Error("CBOR ended early");
+    const first = bytes[pos++];
+    const major = first >> 5;
+    const info = first & 0x1f;
+    if (major === 0) return length(info);
+    if (major === 1) return -1 - length(info);
+    if (major === 2 || major === 3) {
+      const n = length(info);
+      const slice = bytes.slice(pos, pos + n);
+      pos += n;
+      return major === 3 ? new TextDecoder().decode(slice) : slice;
+    }
+    if (major === 4) {
+      const n = length(info);
+      const out = [];
+      if (n < 0) while (bytes[pos] !== 0xff) out.push(item());
+      else for (let i = 0; i < n; i++) out.push(item());
+      if (n < 0) pos++;
+      return out;
+    }
+    if (major === 5) {
+      const n = length(info);
+      const out = {};
+      const entry = () => { const k = item(); out[typeof k === "string" ? k : JSON.stringify(k)] = item(); };
+      if (n < 0) while (bytes[pos] !== 0xff) entry();
+      else for (let i = 0; i < n; i++) entry();
+      if (n < 0) pos++;
+      return out;
+    }
+    if (major === 7) {
+      if (info === 20) return false;
+      if (info === 21) return true;
+      if (info === 22 || info === 23) return null;
+      if (info === 25) { pos += 2; return null; }
+      if (info === 26) { const v = view.getFloat32(pos); pos += 4; return v; }
+      if (info === 27) { const v = view.getFloat64(pos); pos += 8; return v; }
+      return null;
+    }
+    throw new Error("unsupported CBOR type");
+  };
+  return item();
+}
+
+function encodeCbor(value) {
+  const out = [];
+  const head = (major, n) => {
+    if (n < 24) out.push((major << 5) | n);
+    else if (n < 256) out.push((major << 5) | 24, n);
+    else out.push((major << 5) | 25, n >> 8, n & 0xff);
+  };
+  const put = (v) => {
+    if (v === null) out.push(0xf6);
+    else if (v === true) out.push(0xf5);
+    else if (v === false) out.push(0xf4);
+    else if (typeof v === "number") head(v < 0 ? 1 : 0, v < 0 ? -1 - v : v);
+    else if (typeof v === "string") { const b = new TextEncoder().encode(v); head(3, b.length); out.push(...b); }
+    else if (Array.isArray(v)) { head(4, v.length); v.forEach(put); }
+    else { const keys = Object.keys(v); head(5, keys.length); keys.forEach((k) => { put(k); put(v[k]); }); }
+  };
+  put(value);
+  return Uint8Array.from(out);
+}
 
 const HEX = "0-9A-Fa-f";
 
@@ -311,6 +399,60 @@ export class Motor {
     return next;
   }
 
+  // ---- the settings files, the way the TaHoma Pro app reads and writes them:
+  // open (file id, mode), then read or write, then close; a pause between each.
+  async readMotorFile() {
+    return this._oneAtATime(async () => {
+      await this.ensure();
+      await this._write("file", Uint8Array.from([0x00, ...MOTOR_FILE, 0x00]));
+      await pause(FILE_PAUSE);
+      await this._write("file", Uint8Array.from([0x03, ...MOTOR_FILE]));
+      await pause(FILE_PAUSE);
+      const bytes = await this._read("file");
+      await pause(FILE_PAUSE);
+      try {
+        await this._write("file", Uint8Array.from([0x04, ...MOTOR_FILE]));
+      } catch (err) {
+        // already closed by the motor, fine
+      }
+      if (!bytes.length) throw new Error("the motor sent an empty settings file");
+      return decodeCbor(bytes);
+    });
+  }
+
+  // Each setting is stored as [value, description]; write back the value in a one-item list.
+  async writeMotorSetting(key, value) {
+    return this._oneAtATime(async () => {
+      await this.ensure();
+      await this._write("file", Uint8Array.from([0x00, ...MOTOR_FILE, 0x01]));
+      await pause(FILE_PAUSE);
+      await this._write("file", Uint8Array.from([0x02, ...encodeCbor({ [key]: [value] })]));
+      await pause(FILE_PAUSE);
+      await this._write("file", Uint8Array.from([0x04]));
+      for (let i = 0; i < 5; i++) {
+        await pause(FILE_PAUSE);
+        try {
+          const status = await this._read("filestatus");
+          if (status.length >= 2 && status[0] === 0x05 && (status[1] === 0x00 || status[1] === 0x64)) return true;
+        } catch (err) {
+          // not readable yet
+        }
+      }
+      return false;
+    });
+  }
+
+  async motorType() {
+    const settings = await this.readMotorFile();
+    const entry = settings && settings.Application;
+    const value = Array.isArray(entry) ? entry[0] : entry;
+    return typeof value === "string" ? value : "unknown";
+  }
+
+  async setMotorType(name) {
+    return this.writeMotorSetting("Application", name);
+  }
+
   async saveLimit(which) {
     await this.write("limit", Uint8Array.from([which === "top" ? 0 : 1]));
   }
@@ -377,8 +519,8 @@ const STYLE = `
   button:disabled { opacity: .5; cursor: default; }
   button.hold { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; padding: 14px 18px; }
   button.hold.on { filter: brightness(1.3); box-shadow: 0 0 0 3px var(--primary-color); }
-  .scratch { border: 1px solid var(--divider-color, #ccc); border-radius: 8px; padding: 12px; margin-top: 12px; }
-  .scratch h2 { margin-bottom: 8px; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; }
   input, select { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ccc);
                   background: var(--card-background-color, #fff); color: var(--primary-text-color); width: 100%; box-sizing: border-box; }
   label { display: block; margin: 10px 0 4px; font-size: 14px; }
@@ -623,7 +765,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       <div class="card"><h2>Events</h2><div class="log">${escapeHtml(this.lines.join("\n"))}</div></div>`;
 
     view.querySelector("#add").onclick = () => {
-      this.wizard = { step: 1, eui64: "", pin: "", name: "", scratch: null };
+      this.wizard = { step: 1, eui64: "", pin: "", name: "" };
       this.view = "wizard";
       this.render();
     };
@@ -640,7 +782,7 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     view.querySelectorAll("[data-cal]").forEach((b) => {
       b.onclick = () => {
         const dev = this.devices.find((d) => d.ieee === b.dataset.cal);
-        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name, scratch: null };
+        this.wizard = { step: 0, eui64: b.dataset.cal.slice(2).toUpperCase(), pin: "", name: dev && dev.friendly_name };
         this.view = "calibrate";
         this.render();
       };
@@ -851,7 +993,6 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     if (w.step === 4) {
       view.querySelector("#calibrate").onclick = () => {
         w.step = 5;
-        if (w.noLimits) w.scratch = { step: 1, swaps: 0, text: "", done: false };
         this.render();
       };
       view.querySelector("#finish").onclick = () => this.goHome();
@@ -879,12 +1020,17 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
     w.noLimits = value !== null && value % 2 === 0;
     if (value === null) note.textContent = "No answer. You can still try the calibration, or check the Zigbee2MQTT log.";
     else if (value % 2) note.textContent = `configStatus ${value}: the motor is calibrated. Fine-tune a limit now, or finish.`;
-    else note.textContent = `configStatus ${value}: the motor has no limits and will not move until it is calibrated. "Calibrate now" walks you through it.`;
+    else note.textContent = `configStatus ${value}: the motor has no limits and will not move until it is calibrated. "Calibrate now" explains what to do.`;
     actions.hidden = false;
   }
 
   calibrationControls() {
+    const w = this.wizard;
+    const hint = w.noLimits
+      ? `<div class="warn"><b>This motor has no limits yet.</b> Hold ▲ for a second: if the blind goes down, press Swap direction. Then hold ▼ to the bottom and save it as the bottom limit, hold ▲ to the top and save it as the top limit, and press Check status. A venetian that shows no tilt in Zigbee2MQTT needs its motor type set to venetian first (Advanced, below).</div>`
+      : "";
     return `
+      ${hint}
       <p class="muted">Hold ▲ or ▼ and the blind moves until you let go. The motor finishes one move before it takes the next, so it can hesitate for a moment every second or so; a bigger move size means fewer hesitations. Put the blind where a limit should be, then save it.</p>
       <div class="row">
         <button class="hold" data-hold="up">▲ Hold to move up</button>
@@ -900,109 +1046,26 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
         <button data-act="limit-top">Save as top limit</button><button data-act="limit-bottom">Save as bottom limit</button>
       </div>
       <div class="row">
+        <button data-act="swap" class="secondary">Swap direction</button>
         <button data-act="stop" class="secondary">Stop</button><button data-act="status" class="secondary">Check status</button>
-        <button id="scratch" class="secondary" ${this.wizard.scratch ? "hidden" : ""}>Set up from scratch</button>
       </div>
-      ${this.scratchPanel()}
-      <p id="note"></p>`;
-  }
-
-  // A motor without limits (configStatus even) ignores every Zigbee command. This
-  // is the sequence TaHoma Pro walks through to give it limits, one step at a time.
-  scratchPanel() {
-    const sc = this.wizard.scratch;
-    if (!sc) return "";
-    const names = ["Direction", "Range", "Bottom", "Top", "Check", "Slats"];
-    const bar = `<div class="steps">${names.map((n, i) => `<span class="step ${i + 1 === sc.step ? "on" : ""}">${i + 1}. ${n}</span>`).join("")}</div>`;
-    let body = "";
-    if (sc.step === 1) {
-      body = `<p>Hold <b>▲ Hold to move up</b> for a second. Did the blind go <b>up</b>?${sc.swaps ? " (direction swapped, try again)" : ""}</p>
-        <div class="row"><button data-scratch="up-ok">Yes, it went up</button><button data-scratch="swap" class="secondary">No, swap the direction</button></div>`;
-    } else if (sc.step === 2) {
-      body = `<p>The motor now forgets its old range and accepts new limits. Nothing moves.</p>
-        <div class="row"><button data-scratch="range-start">Range start</button></div>`;
-    } else if (sc.step === 3) {
-      body = `<p>Hold <b>▼</b> until the blind is where it should stop at the bottom (▼ a little for the last bit), then save it.</p>
-        <div class="row"><button data-scratch="limit-bottom">Save as bottom limit</button></div>`;
-    } else if (sc.step === 4) {
-      body = `<p>Hold <b>▲</b> until the blind is where it should stop at the top, then save it.</p>
-        <div class="row"><button data-scratch="limit-top">Save as top limit</button></div>`;
-    } else if (sc.step === 5) {
-      body = `<p id="scratchnote">${escapeHtml(sc.text || "Asking the motor whether it has its limits now...")}</p>
-        <div class="row" id="scratchactions" ${sc.text ? "" : "hidden"}>
-          ${sc.done ? `<button data-scratch="finish">Done</button>` : `<button data-scratch="slats">Set up the slats</button><button data-scratch="check" class="secondary">Check again</button>`}
-        </div>`;
-    } else if (sc.step === 6) {
-      body = `<p>The slats, the way TaHoma Pro's "blade tilting" does it: <b>Range start</b>, then <b>Slats down</b> until the slats are fully closed one way, <b>Slats up</b> until fully closed the other way, then <b>Range full</b>. The slats turn with the same motor, so these feel like small moves up and down.</p>
-        <div class="row"><button data-scratch="range-start" class="secondary">Range start</button>
+      <details ${w.noLimits ? "open" : ""}>
+        <summary class="muted">Advanced: motor type and slats</summary>
+        <p class="muted">The motor has a type setting. A venetian motor still set to "Roller" has no tilt at all and shows up in Zigbee2MQTT as a roller blind; TaHoma Pro sets the type during installation, so blinds it installed are fine.</p>
+        <div class="row">
+          <button data-act="type-read" class="secondary">Read motor type</button>
+          <button data-act="type-venetian" class="secondary">Set to venetian</button>
+          <span id="mtype" class="muted">${escapeHtml(w.motorType ? `Motor type: ${w.motorType}` : "")}</span>
+        </div>
+        <p class="muted">Slats range, what 0%, 50% and 100% tilt mean (TaHoma Pro calls it blade tilting). Needed once on a venetian whose type was just set, never on a blind TaHoma Pro installed: Range start, Slats down until the slats are closed one way, Slats up until closed the other way, Range full. The slats turn with the same motor, so these feel like small moves up and down.</p>
+        <div class="row">
+          <button data-act="range-start" class="secondary">Range start</button>
           <select id="tstep" style="width:auto"><option value="50">50 tilt steps</option><option value="10">10 tilt steps</option></select>
           <button data-act="tilt-down" class="secondary">Slats down</button><button data-act="tilt-up" class="secondary">Slats up</button>
-          <button data-scratch="range-full" class="secondary">Range full</button></div>
-        <div class="row"><button data-scratch="check">Check status</button></div>`;
-    }
-    return `<div class="scratch"><h2>Setting up from scratch</h2>${bar}${body}</div>`;
-  }
-
-  async scratchAction(view, act) {
-    const w = this.wizard;
-    const sc = w.scratch;
-    const m = this.motor;
-    try {
-      if (act === "swap") {
-        const next = await m.swapDirection();
-        sc.swaps += 1;
-        this.say(`direction set to ${next ? "clockwise" : "counter-clockwise"}`);
-      } else if (act === "up-ok") {
-        sc.step = 2;
-      } else if (act === "range-start") {
-        await m.rangeStart();
-        this.say("range setup started");
-        if (sc.step === 2) sc.step = 3;
-      } else if (act === "limit-bottom") {
-        await m.saveLimit("bottom");
-        this.say("bottom limit saved");
-        sc.step = 4;
-      } else if (act === "limit-top") {
-        await m.saveLimit("top");
-        this.say("top limit saved");
-        sc.step = 5;
-        sc.text = "";
-        this.render();
-        return this.scratchCheck();
-      } else if (act === "range-full") {
-        await m.rangeFull();
-        this.say("range setup finished");
-      } else if (act === "check") {
-        sc.step = 5;
-        sc.text = "";
-        this.render();
-        return this.scratchCheck();
-      } else if (act === "slats") {
-        sc.step = 6;
-      } else if (act === "finish") {
-        w.scratch = null;
-      }
-      this.render();
-    } catch (err) {
-      this.say("error: " + err.message);
-      const note = view.querySelector("#note");
-      if (note) {
-        note.textContent = err.message;
-        note.className = "bad";
-      }
-    }
-  }
-
-  async scratchCheck() {
-    const sc = this.wizard.scratch;
-    const value = await this.configStatus(this.wizard.eui64).catch(() => null);
-    if (!sc || sc.step !== 5) return;
-    if (value === null) sc.text = "No answer from Zigbee2MQTT. Check again in a moment.";
-    else if (value % 2) {
-      sc.text = `configStatus ${value}: the motor has its limits now and will move. You can fine-tune them above.`;
-      sc.done = true;
-    } else sc.text = `configStatus ${value}: still no limits. On a venetian the slats need their range too.`;
-    this.render();
+          <button data-act="range-full" class="secondary">Range full</button>
+        </div>
+      </details>
+      <p id="note"></p>`;
   }
 
   // The browser's list only shows names, so a wrong pick is normal; remember the
@@ -1069,15 +1132,6 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
       for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(type, this._release);
       b.addEventListener("contextmenu", (ev) => ev.preventDefault());
     });
-    const scratch = view.querySelector("#scratch");
-    if (scratch)
-      scratch.onclick = () => {
-        this.wizard.scratch = { step: 1, swaps: 0, text: "", done: false };
-        this.render();
-      };
-    view.querySelectorAll("[data-scratch]").forEach((b) => {
-      b.onclick = () => this.scratchAction(view, b.dataset.scratch);
-    });
     view.querySelectorAll("[data-act]").forEach((b) => {
       b.onclick = async () => {
         const act = b.dataset.act;
@@ -1102,6 +1156,30 @@ class SomfyZigbeeSetupPanel extends HTMLElement {
             if (!confirm(`Save the current position as the ${which} limit?`)) return;
             await m.saveLimit(which);
             this.say(`${which} limit saved`);
+          } else if (act === "swap") {
+            const next = await m.swapDirection();
+            this.say(`direction set to ${next ? "clockwise" : "counter-clockwise"} - hold ▲ to check, swap again if it still goes down`);
+          } else if (act === "range-start") {
+            if (!confirm("Start the slats range: the motor forgets its slat range until you press Range full. Continue?")) return;
+            await m.rangeStart();
+            this.say("slats range started: Slats down to one end, Slats up to the other, then Range full");
+          } else if (act === "range-full") {
+            if (!confirm("Finish the slats range with the current end positions?")) return;
+            await m.rangeFull();
+            this.say("slats range saved");
+          } else if (act === "type-read") {
+            const type = await m.motorType();
+            this.wizard.motorType = type;
+            view.querySelector("#mtype").textContent = `Motor type: ${type}`;
+            this.say(`motor type: ${type}`);
+          } else if (act === "type-venetian") {
+            if (!confirm("Set the motor type to venetian? The motor forgets its limits and needs them set again, and Zigbee2MQTT must interview it again. Continue?")) return;
+            const ok = await m.setMotorType("Venetian");
+            this.wizard.motorType = "Venetian (written)";
+            view.querySelector("#mtype").textContent = "Motor type: Venetian (written)";
+            this.say(ok ? "motor type set to venetian, the motor confirmed" : "motor type written, the motor did not confirm (it may still have taken it)");
+            note("Now: cut the motor's power for 10 seconds if you can, press Interview on its Zigbee2MQTT page (the model should read Venetian), then set the limits again and the slats range.");
+            return;
           }
           note("");
         } catch (err) {

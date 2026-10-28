@@ -45,6 +45,11 @@ MOVE_UP = uuid(0x00010009)
 RANGE = uuid(0x0001000B)
 LEAVE = uuid(0x00020001)
 CHANNEL = uuid(0x00020002)
+# the motor's settings files: commands on one characteristic, result on another
+FILE_CMD = uuid(0x00040001)
+FILE_STATUS = uuid(0x00040003)
+MOTOR_FILE = b"\xc4\x00"      # file 0x00C4, low byte first
+FILE_PAUSE = 0.5               # the motor wants a pause between file commands
 PAN = uuid(0x00020003)
 EUI = uuid(0x00020005)
 
@@ -61,6 +66,8 @@ CALIBRATE_HELP = """
   range start                  start a new range setup (the motor forgets its range)
   range full                   finish the range setup
   direction cw / direction ccw set the turning direction (swap if up moves down)
+  type                         read the motor type (Roller, Venetian...) and ranges
+  type venetian                set the motor type (a venetian set to Roller has no tilt)
   guide                        the order to do things in
   quit
 """
@@ -76,9 +83,14 @@ CALIBRATE_GUIDE = """
     3. down 100 until the blind is where the bottom should be
        (use down 20 or down 5 near the end), then: limit down
     4. up 100 until it is where the top should be, then: limit up
-    5. status - odd means done. If still even on a venetian, the slats:
-       range start, tilt-down 50 until the slats stop turning,
-       tilt-up 50 until they stop the other way, range full, status
+    5. status - odd means done
+
+  A venetian whose motor type is Roller has no tilt at all and shows up in
+  Zigbee2MQTT as a roller blind: 'type' tells, 'type venetian' changes it
+  (power-cycle the motor, re-interview it in Zigbee2MQTT, set the limits
+  again). Then the slats range, which is what tilt 0-100% means:
+    range start, tilt-down 50 until the slats stop turning,
+    tilt-up 50 until they stop the other way, range full
 
   If the motor disappears from Zigbee2MQTT after step 4, turn on permit join
   and run 'somfy_setup.py pair' again. The limits stay in the motor.
@@ -177,6 +189,89 @@ def advertised_eui48(adv):
 def eui48_of(eui64):
     """A Sonesse2 motor's Bluetooth address is its EUI64 without the FFFE in the middle."""
     return eui64[:6] + eui64[10:] if eui64[6:10] == "FFFE" else None
+
+
+# ---------------------------------------------------------------- the settings files
+# CBOR, the subset the motor's settings files use. Each setting is stored as
+# [value, description]; a write sends {key: [value]}.
+
+def cbor_decode(data):
+    pos = 0
+
+    def length(info):
+        nonlocal pos
+        if info < 24:
+            return info
+        size = {24: 1, 25: 2, 26: 4, 27: 8}[info]
+        value = int.from_bytes(data[pos:pos + size], "big")
+        pos += size
+        return value
+
+    def item():
+        nonlocal pos
+        first = data[pos]
+        pos += 1
+        major, info = first >> 5, first & 0x1F
+        if major == 0:
+            return length(info)
+        if major == 1:
+            return -1 - length(info)
+        if major in (2, 3):
+            n = length(info)
+            raw = data[pos:pos + n]
+            pos += n
+            return raw.decode("utf-8", "replace") if major == 3 else raw
+        if major == 4:
+            return [item() for _ in range(length(info))]
+        if major == 5:
+            out = {}
+            for _ in range(length(info)):
+                key = item()
+                out[key if isinstance(key, str) else repr(key)] = item()
+            return out
+        if major == 7:
+            if info == 20:
+                return False
+            if info == 21:
+                return True
+            if info in (22, 23):
+                return None
+            pos += {25: 2, 26: 4, 27: 8}.get(info, 0)
+            return None
+        raise ValueError("unsupported CBOR")
+
+    return item()
+
+
+def cbor_encode(value):
+    def head(major, n):
+        if n < 24:
+            return bytes([(major << 5) | n])
+        if n < 256:
+            return bytes([(major << 5) | 24, n])
+        return bytes([(major << 5) | 25]) + n.to_bytes(2, "big")
+
+    if value is None:
+        return b"\xf6"
+    if value is True:
+        return b"\xf5"
+    if value is False:
+        return b"\xf4"
+    if isinstance(value, int):
+        return head(0 if value >= 0 else 1, value if value >= 0 else -1 - value)
+    if isinstance(value, str):
+        raw = value.encode()
+        return head(3, len(raw)) + raw
+    if isinstance(value, list):
+        return head(4, len(value)) + b"".join(cbor_encode(v) for v in value)
+    if isinstance(value, dict):
+        return head(5, len(value)) + b"".join(cbor_encode(k) + cbor_encode(v) for k, v in value.items())
+    raise ValueError("cannot encode %r" % (value,))
+
+
+def setting(settings, key):
+    entry = settings.get(key) if isinstance(settings, dict) else None
+    return entry[0] if isinstance(entry, list) and entry else entry
 
 
 async def read_eui(client):
@@ -292,6 +387,39 @@ class Motor:
     async def read(self, char):
         await self.ensure()
         return bytes(await asyncio.wait_for(self.client.read_gatt_char(char), 5))
+
+    async def read_motor_file(self):
+        """Open the motor settings file for reading, read it, close it."""
+        await self.write(FILE_CMD, b"\x00" + MOTOR_FILE + b"\x00")
+        await asyncio.sleep(FILE_PAUSE)
+        await self.write(FILE_CMD, b"\x03" + MOTOR_FILE)
+        await asyncio.sleep(FILE_PAUSE)
+        data = await self.read(FILE_CMD)
+        await asyncio.sleep(FILE_PAUSE)
+        try:
+            await self.write(FILE_CMD, b"\x04" + MOTOR_FILE)
+        except Exception:
+            pass
+        if not data:
+            raise RuntimeError("the motor sent an empty settings file")
+        return cbor_decode(data)
+
+    async def write_motor_setting(self, key, value):
+        """Open for writing, send {key: [value]}, close, then ask the motor whether it took it."""
+        await self.write(FILE_CMD, b"\x00" + MOTOR_FILE + b"\x01")
+        await asyncio.sleep(FILE_PAUSE)
+        await self.write(FILE_CMD, b"\x02" + cbor_encode({key: [value]}))
+        await asyncio.sleep(FILE_PAUSE)
+        await self.write(FILE_CMD, b"\x04")
+        for _ in range(5):
+            await asyncio.sleep(FILE_PAUSE)
+            try:
+                status = await self.read(FILE_STATUS)
+            except Exception:
+                continue
+            if len(status) >= 2 and status[0] == 0x05 and status[1] in (0x00, 0x64):
+                return True
+        return False
 
     async def leave_network(self):
         # the motor usually drops the Bluetooth link right after this, which is fine
@@ -691,6 +819,24 @@ async def calibrate_command(motor, z2m, line):
     elif cmd == "direction" and args[:1] in (["cw"], ["ccw"]):
         await motor.write(DIRECTION, b"\x01" if args[0] == "cw" else b"\x00")
         print(f"  direction set to {'clockwise' if args[0] == 'cw' else 'counter-clockwise'}")
+    elif cmd == "type" and not args:
+        settings = await motor.read_motor_file()
+        for key in ("Application", "LiftRange", "TiltRange", "ReversedDirection"):
+            if key in settings:
+                print(f"  {key}: {setting(settings, key)}")
+        others = [k for k in settings if k not in ("Application", "LiftRange", "TiltRange", "ReversedDirection")]
+        if others:
+            print("  also in the file:", ", ".join(others))
+    elif cmd == "type" and args[:1] in (["venetian"], ["roller"]):
+        name = args[0].capitalize()
+        if await confirm(f"Set the motor type to {name}? The motor forgets its limits, needs a power cycle "
+                         "and a new interview in Zigbee2MQTT. Continue?"):
+            ok = await motor.write_motor_setting("Application", name)
+            print(f"  motor type {name} written" + (", the motor confirmed" if ok else ", the motor did not confirm (it may still have taken it)"))
+            print("  Now cut the motor's power for 10 seconds, press Interview on its Zigbee2MQTT page,")
+            print("  then set the limits again (and the slats range for a venetian).")
+        else:
+            print("  cancelled")
     else:
         print("  unknown command - type help")
     return True

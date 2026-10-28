@@ -86,7 +86,9 @@ The limits live in the motor. You can change them while the blind stays paired w
 
 On the Home Assistant page: hold **▲** or **▼** and the blind moves until you let go (the page sends a stop the moment the button is released, also if the page loses focus). The motor only takes a move command once it has finished the previous one, so the page offers the next move every 150 ms while you hold, and the blind can hesitate for a moment about once a second; choosing a bigger move size next to the buttons makes that rarer. The **a little** buttons move by a few steps for the last millimetres. Put the blind where the limit should be and press **Save as top limit** or **Save as bottom limit**. That is all a motor that already has limits needs.
 
-A motor without limits (configStatus even, which is what a factory reset or a brand new motor gives you) ignores every Zigbee command, and the page walks you through what TaHoma Pro does to give it limits, one step at a time, under **Set up from scratch** (the wizard opens it by itself when it finds an even configStatus): first the direction (hold ▲, did it go up? if not, **swap the direction**, which the motor remembers), then **Range start** (the motor forgets its old range), hold ▼ to the bottom and save it, hold ▲ to the top and save it, then the page reads configStatus again. If it is still even on a venetian, the slats need their range too, the way TaHoma Pro's "blade tilting" does it: Range start, slats closed one way, slats closed the other way, Range full. On a venetian the slats turn with the same motor, so the slat buttons feel like small up and down moves.
+A motor without limits (configStatus even, which is what a factory reset or a brand new motor gives you) ignores every Zigbee command. The same buttons set it up, in this order, and the page says so when it finds an even configStatus: hold ▲ for a second and check the blind went up, **Swap direction** if it went down (the motor remembers it); hold ▼ to the bottom, **Save as bottom limit**; hold ▲ to the top, **Save as top limit**; **Check status**, which should now be odd.
+
+Two more things live under **Advanced**, both for a venetian that TaHoma Pro never installed. The motor has a *type* setting, and a venetian motor can leave the factory set to "Roller": then it has no tilt at all and Zigbee2MQTT recognises it as the roller model (native support, position only). **Read motor type** shows the setting; **Set to venetian** changes it, after which the motor needs a power cycle, a new interview in Zigbee2MQTT (the model becomes `Sonesse2 40 Zigbee Venetian`, which this project's converter handles, with tilt), and its limits set again. Then the *slats range*, which is what tilt 0%, 50% and 100% mean and what TaHoma Pro calls blade tilting: **Range start**, **Slats down** until the slats are closed one way, **Slats up** until closed the other way, **Range full**. The slats turn with the same motor, so these feel like small up and down moves. Blinds that TaHoma Pro installed have both already.
 
 TaHoma Pro also asks for an intermediate position (the "my" position of Somfy remotes). Zigbee2MQTT can send the blind to any position, so there is nothing to store and the page does not ask.
 
@@ -102,10 +104,12 @@ The same commands at the tool's `somfy>` prompt:
     range start                  start a new range setup (the motor forgets its range)
     range full                   finish the range setup
     direction cw / direction ccw set the turning direction (swap if up moves down)
+    type                         read the motor type (Roller, Venetian...) and ranges
+    type venetian                set the motor type
 
 To fine-tune a limit, move the blind with `up` and `down` until it is where you want it, then `limit up` or `limit down`. I tested this on my blind, in both directions: the new limit is used immediately and the blind stays in Zigbee2MQTT.
 
-To set a motor up from scratch (configStatus even): `up 100` and check the blind went up, `direction cw` (or `ccw`) if it went down; `range start`; move down to the bottom position and `limit down`; move up to the top and `limit up`; `status`. For the slats on a venetian, if the status is still even: `range start`, turn the slats to one end with `tilt-down`, to the other end with `tilt-up`, then `range full`. This is the order the TaHoma Pro app uses. Use small steps near the ends, the motor has no limits at that point and will happily drive the blind past them.
+To set a motor up from scratch (configStatus even): `up 100` and check the blind went up, `direction cw` (or `ccw`) if it went down; move down to the bottom position and `limit down`; move up to the top and `limit up`; `status`. A venetian whose `type` says Roller: `type venetian`, power cycle, re-interview in Zigbee2MQTT, limits again, then the slats range: `range start`, `tilt-down 50` until the slats stop turning, `tilt-up 50` until they stop the other way, `range full`. Use small steps near the ends, the motor has no limits at that point and will happily drive the blind past them.
 
 A motor can leave the Zigbee network when it saves a new range. If that happens, turn on permit join and run `pair` again. The limits stay in the motor.
 
@@ -139,6 +143,8 @@ The Bluetooth protocol is Somfy's own, found by [Melair](https://mrmelair.com/20
 Over Zigbee the motor is a standard window covering (cluster 258) on endpoint 1. `configStatus` is attribute 7 of that cluster and its lowest bit means "operational".
 
 The Bluetooth advertisement carries Somfy's company id (1480) and 9 bytes of manufacturer data; bytes 1 to 6 are the motor's Bluetooth address, last byte first. The motor also advertises its name, the one given in TaHoma Pro, which is stored in the motor.
+
+The motor's settings (type, ranges, direction, name) are small CBOR files read and written through one more characteristic, the way the TaHoma Pro app does it; this project only touches the type. The protocol was worked out by magik6k (credits below).
 
 ## Development
 
